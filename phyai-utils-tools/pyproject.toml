@@ -18,7 +18,6 @@ dependencies = [
 [project.optional-dependencies]
 # fastokens accelerates phyai_utils_tools.tokenizer and processor utilities.
 fastokenizer = ["fastokens>=0.2.0"]
-enactive = ["sentencepiece>=0.2.0"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

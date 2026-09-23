@@ -1,8 +1,11 @@
 # Enactive pi0.5 checkpoint adapter and validation
 
 The adapter runs the selected `inference-500` export through Phyai's existing
-`pi05` engine. It adds a checkpoint converter, an Enactive processor and a runnable
-example. The model, scheduler, layers and kernels are unchanged.
+`pi05` engine and `PI05Processor`. Checkpoint sidecars configure the existing
+pipeline with an instruction-only prompt, PIL resizing and state-anchored action
+decoding. There is no separate Enactive processor or new runtime dependency.
+The model, scheduler, layers and kernels are unchanged. The conversion scripts
+are retained locally as untracked files.
 
 Validation on 2026-09-23 passed the numerical comparison gates: cosine similarity
 above 0.99 for the first flow velocity and the final actions. Preprocessing,
@@ -71,8 +74,8 @@ Text follows `openpi_pi05_instruction_3view.py`: strip surrounding whitespace,
 replace underscores and newlines with spaces, tokenize using the checkpoint's
 SentencePiece model with BOS, append the separately tokenized newline, truncate
 to 200 tokens and pad with token 0. The instruction contains no discretized state.
-The normalized state is retained for diagnostics; it is not an engine input for
-this checkpoint's instruction-only contract.
+The normalized state remains in the pipeline transition for diagnostics; it is
+not an engine input for this checkpoint's instruction-only contract.
 
 The engine returns `[B, 50, 32]` normalized actions. The processor keeps the first
 14 dimensions and applies checkpoint quantiles:
@@ -90,9 +93,18 @@ observation; the processor stores no previous observation.
 
 ## Conversion and inference
 
-Run from the repository root with a working Phyai environment. Install the
-optional tokenizer dependency with `uv pip install sentencepiece`; it is also
-available as the `enactive` extra on `phyai-utils-tools`.
+Run from the repository root with a working Phyai environment. The checkpoint
+includes a fast `tokenizer.json` exported from its exact original vocabulary.
+The existing tokenizer loader uses fastokens when installed, or the HuggingFace
+Rust tokenizer otherwise. Both were verified against the original SentencePiece
+IDs. No SentencePiece package is required for inference; it was uninstalled
+from the Phyai test environment. The existing `fastokenizer` extra remains
+optional.
+
+The following conversion command uses local, untracked scripts. Conversion of
+an original `.model` file requires SentencePiece once in the export environment;
+that dependency is not declared by Phyai. The already converted checkpoint is
+ready for inference.
 
 ```bash
 uv run --no-sync python examples/pi05/convert_enactive.py \
@@ -109,7 +121,8 @@ uv run --no-sync python examples/pi05/run_enactive.py \
 Set `ENACTIVE_RUN` to the source run directory. Conversion requires a new output
 directory and rejects an existing destination. It streams and verifies every
 mapped tensor, preserves source sidecars and writes an explicit Phyai geometry
-configuration. There are 819 source tensors: 811 BF16 inference tensors are
+configuration, a fast tokenizer, and `policy_preprocessor.json` /
+`policy_postprocessor.json` with normalization sidecars. There are 819 source tensors: 811 BF16 inference tensors are
 mapped without changing any bytes; eight unused state-projection or training
 statistics tensors are omitted with individual reasons. Phyai's strict loader
 loaded all 811 tensors with zero missing or unexpected keys. Its 110 normalization
@@ -127,12 +140,38 @@ reject a later, longer prompt if its first attention wrapper was initialized
 with a shorter capacity. The local eager comparison initializes the longest
 prompt first. No scheduler workaround is installed by this adapter.
 
-For batches, pass a list of instructions, `[B,14]` states and a list of HWC images
-per camera to `EnactivePI05Processor.preprocess`, and construct the existing
-`PI05Args` with the required `max_batch_size`. Decode with the matching batch of
-raw states.
+The example loads `PI05Processor.from_pretrained` with the checkpoint itself as
+`tokenizer_name`, `image_resize_backend="pil"`, `normalize_pixels=True`,
+`action_dim=14` and float32 preprocessing. It converts raw HWC arrays to the
+existing processor's BCHW camera-tensor interface.
+
+For batches, pass a list of instructions, `[B,14]` states and one `[B,3,H,W]`
+uint8 tensor per camera. Images within each camera batch must share dimensions;
+observations of different sizes can be processed separately and concatenated.
+Construct the existing `PI05Args` with the required `max_batch_size` and decode
+using the matching raw states. The serialized postprocessor's delta mask keeps
+gripper predictions absolute.
 
 ## Validation results
+
+After the processor reuse revision, both fastokens 0.3.2 and the existing
+HuggingFace Rust backend passed 1,956 checks each with SentencePiece absent.
+The 1,931 text cases cover multilingual and long prompts, control-token strings,
+Unicode, empty input, and repeated or mixed whitespace. Token IDs and lengths
+match SentencePiece exactly. The remaining checks compare five independent
+Enactive preprocessing/postprocessing fixtures, all 12 saved model input/output
+fixtures, serialization, batching and invalid action anchors. Forty existing
+processing regression tests also passed.
+
+The fast tokenizer export keeps whitespace symbols in its BPE vocabulary rather
+than registering them as AddedTokens. This avoids matching literal whitespace
+markers before normalization and splitting mixed spaces into different tokens.
+Both backends passed the full corpus with this artifact. Prompt cleanup and the
+separately encoded newline are configured through shared pipeline steps.
+
+The 12 single and batched GPU comparisons and the runnable example were repeated
+using the reused processor. The example and all single-request outputs remain
+bitwise identical to the earlier Phyai results reported below.
 
 All model comparisons used the same exported checkpoint and explicit initial
 noise, on one H800 held by `salloc` through the end of GPU testing. Reference:
@@ -150,9 +189,9 @@ fixtures, not frames from the training dataset.
 
 | Check | Result |
 | --- | --- |
-| Processor tests against Enactive runtime | 44 passed |
-| Converter tests, including shard corruption and cleanup | 24 passed |
-| Existing PI0 / PI05 processor regression tests | 12 passed |
+| Original processor characterization against Enactive runtime | 44 passed |
+| Original weight converter tests, before offline processor export was added | 24 passed |
+| Current shared processing regression tests, including PI0 / PI05 | 40 passed |
 | Full checkpoint load, both engines | No missing or unexpected tensors |
 | Pixel values, language tokens/lengths, normalized states | Exact agreement |
 | Postprocessing with common normalized actions | Exact agreement |
@@ -192,34 +231,37 @@ Bitwise agreement with Enactive would require changes beyond this input/output
 adapter. Actual robot tolerances and task success remain unmeasured.
 
 Repository instructions keep model tests outside the committed tree. The local
-`.cache/enactive-align` directory contains `test_processor.py`,
-`test_conversion.py`, `reference_probe.py`, `phyai_probe.py`, `batch_probe.py`,
-`verify_results.py`, fixed NPZ inputs, reference outputs, per-case JSON metrics,
-and JUnit results. `validation-summary.json` asserts the single-request gates;
-`batch-report.json` records the batch comparisons. `conversion_report.json` in
-the checkpoint directory records source/output file SHA256 values and all tensor
-mappings. These files remain available with this worktree.
+`.cache/enactive-align/reuse` directory contains the current `test_reuse.py`,
+`build_references.py`, independent tokenizer/processor fixtures, JUnit files and
+logs for both backends. `.cache/enactive-align` also contains the 12 fixed model
+inputs, Enactive outputs, `phyai_probe.py`, `batch_probe.py` and
+`verify_results.py`. Older characterization tests remain as historical artifacts;
+the current processor suite is `reuse/test_reuse.py`.
 
-The reference tests run in the Enactive environment; converter and Phyai tests
-run in Python 3.12. The local `phyai-python` launcher supplies the cluster's CUDA
-compatibility library and environment paths. The verification commands used were:
+`conversion_report.json` in the checkpoint directory records source/output file
+SHA256 values and all tensor mappings. The tokenizer and processor artifacts
+remain local with the weights. Conversion scripts at
+`examples/pi05/convert_enactive.py` and
+`phyai-utils-tools/src/phyai_utils_tools/models/pi05/convert_enactive_pi05.py`
+are untracked and are not part of the branch's final source tree.
+
+The reference fixtures were generated in the Enactive environment. Tests and
+inference run in Phyai's Python 3.12 environment. The local `phyai-python`
+launcher supplies the cluster's CUDA compatibility library and environment
+paths. Commands for the current validation are:
 
 ```bash
-"$ENACTIVE_PYTHON" -m pytest -c /dev/null --confcutdir=.cache/enactive-align \
-  -p no:cacheprovider .cache/enactive-align/test_processor.py -q
-.venv/bin/python -m pytest -c /dev/null --confcutdir=.cache/enactive-align \
-  -p no:cacheprovider .cache/enactive-align/test_conversion.py -q
+.venv/bin/python -m pytest -c /dev/null --confcutdir=.cache/enactive-align/reuse \
+  -p no:cacheprovider .cache/enactive-align/reuse/test_reuse.py -q
+PHYAI_REUSE_BACKEND=hf .venv/bin/python -m pytest -c /dev/null \
+  --confcutdir=.cache/enactive-align/reuse -p no:cacheprovider \
+  .cache/enactive-align/reuse/test_reuse.py -q
 # Run GPU commands inside the retained Slurm allocation.
-"$ENACTIVE_PYTHON" .cache/enactive-align/reference_probe.py --dtype bfloat16 --count 12
-.cache/enactive-align/phyai-python .cache/enactive-align/phyai_probe.py --dtype bfloat16 --count 12
-.cache/enactive-align/phyai-python .cache/enactive-align/phyai_probe.py --dtype bfloat16 --count 12 --graphs
+.cache/enactive-align/phyai-python .cache/enactive-align/phyai_probe.py --count 12 --graphs
 .cache/enactive-align/phyai-python .cache/enactive-align/batch_probe.py
 .cache/enactive-align/phyai-python examples/pi05/run_enactive.py \
   --checkpoint .cache/checkpoints/enactive-pi05-step500 \
-  --input .cache/enactive-align/case0.npz --output .cache/enactive-align/example-result.npz
+  --input .cache/enactive-align/case0.npz --output .cache/enactive-align/reuse/example-result.npz
 .venv/bin/python .cache/enactive-align/verify_results.py
-.cache/enactive-align/phyai-python -m pytest \
-  phyai-utils-tools/tests/test_pi05_processor.py \
-  phyai-utils-tools/tests/test_pi0_processor.py -q
 scripts/run_pre_commit.sh
 ```

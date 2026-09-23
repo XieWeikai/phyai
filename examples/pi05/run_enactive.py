@@ -19,7 +19,7 @@ from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
 from phyai.models.pi05.scheduler_pi05 import PI05Request
 from phyai.utils import get_logger, load_config
-from phyai_utils_tools.models.pi05 import EnactivePI05Processor
+from phyai_utils_tools.models.pi05 import PI05Processor
 
 logger = get_logger(__name__)
 
@@ -33,15 +33,25 @@ def main() -> None:
     parser.add_argument("--no-cuda-graph", action="store_true")
     args = parser.parse_args()
 
-    processor = EnactivePI05Processor.from_pretrained(args.checkpoint)
+    processor = PI05Processor.from_pretrained(
+        args.checkpoint,
+        tokenizer_name=str(args.checkpoint),
+        image_resize_backend="pil",
+        normalize_pixels=True,
+        action_dim=14,
+        params_dtype=torch.float32,
+    )
     config = load_config(args.checkpoint, PI05Config)
     with np.load(args.input, allow_pickle=False) as payload:
         raw_state = payload["state"].copy()
         processed = processor.preprocess(
             {
-                "images": {view: payload[view] for view in ("front", "left", "right")},
+                "images": [
+                    torch.from_numpy(payload[view].copy()).permute(2, 0, 1).unsqueeze(0)
+                    for view in ("front", "left", "right")
+                ],
                 "task": str(payload["task"].item()),
-                "state": raw_state,
+                "state": torch.from_numpy(raw_state).unsqueeze(0),
             }
         )
         noise = (
