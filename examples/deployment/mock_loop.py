@@ -7,7 +7,6 @@ Engine, GPU, ROS installation, or external transport dependency is required.
 from __future__ import annotations
 
 import argparse
-from typing import TypeAlias
 from collections.abc import Mapping
 
 import numpy as np
@@ -28,7 +27,7 @@ from phyai_robot.backends.mock import MockBackend
 # Both mappings have "left.target_q" and "right.target_q" keys. Each value is
 # a float32 array of shape (7,), in radians and in the robot schema joint order.
 # A request contains current positions; a prediction contains absolute targets.
-JointPositions: TypeAlias = Mapping[str, NDArray[np.float32]]
+type JointPositions = Mapping[str, NDArray[np.float32]]
 
 
 class SmallStepPolicy:

@@ -113,11 +113,11 @@ from the **PhyAI repository root**, one directory above this README.
 ### Try the Mock example without a GPU
 
 This command creates an isolated environment for the local package and runs the
-complete [dual-arm example](../examples/robot/mock_loop.py):
+complete [dual-arm example](../examples/deployment/mock_loop.py):
 
 ```bash
 uv run --no-project --isolated --with-editable ./phyai-robot \
-  python examples/robot/mock_loop.py --steps 30
+  python examples/deployment/mock_loop.py --steps 30
 ```
 
 Expected output:
@@ -137,7 +137,7 @@ alongside the engine:
 
 ```bash
 uv sync --package phyai --extra deployment
-uv run --no-sync python examples/robot/mock_loop.py --steps 30
+uv run --no-sync python examples/deployment/mock_loop.py --steps 30
 ```
 
 To include the Robot package's ZMQ dependencies, select that package and its
@@ -173,7 +173,7 @@ UV_PROJECT_ENVIRONMENT=.venv-robot \
   uv sync --package phyai-robot --no-default-groups
 
 UV_PROJECT_ENVIRONMENT=.venv-robot \
-  uv run --no-sync python examples/robot/mock_loop.py --steps 30
+  uv run --no-sync python examples/deployment/mock_loop.py --steps 30
 ```
 
 Add `--extra zmq` to the sync command for ZMQ. `--no-default-groups` omits default
@@ -204,7 +204,7 @@ or ZMQ. Transport SDKs are loaded when the corresponding backend connects.
 
 ## Understand the dual-arm example
 
-[`examples/robot/mock_loop.py`](../examples/robot/mock_loop.py) is a complete
+[`examples/deployment/mock_loop.py`](../examples/deployment/mock_loop.py) is a complete
 application with two seven-joint arms, one gripper per arm, and an independent RGB
 camera. Start with its `main()` function to see the composition:
 
@@ -446,5 +446,20 @@ uv run --no-project --isolated --with-editable './phyai-robot[zmq]' --with pytes
 
 The explicit pytest configuration and `--confcutdir` keep this package's tests
 independent of the repository's CUDA test bootstrap. They need no GPU or physical
-robot. See the [example](../examples/robot/mock_loop.py) for the complete application
+robot. See the [example](../examples/deployment/mock_loop.py) for the complete application
 and the [source directory](src/phyai_robot) for the typed interfaces and implementations.
+
+## Tianji pi0.5 deployment
+
+The live entry point is [`examples/deployment/tianji.py`](../examples/deployment/tianji.py).
+Its opening docstring describes environment setup, controller modes, every YAML
+setting, bounded trials, and continuous deployment. The example keeps embodiment
+construction in `robots/tianji.py`, model I/O in `adapters/tianji_pi05.py`, and
+editable defaults in `configs/tianji.yaml`. OmegaConf merges typed YAML with
+dotted command-line overrides; `--print-config` inspects settings without
+connecting to ROS or allocating a model. The loader has no robot/model-specific
+fields: Tianji connection settings live with its factory, pi0.5 mapping settings
+live with its adapter, and the entry point composes their schemas. Running
+without `--print-config` enables control and executes model actions. Check
+controller ownership and physical gripper calibration before launching; these
+are operator responsibilities, not automatically discovered service state.

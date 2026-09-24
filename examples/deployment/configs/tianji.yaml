@@ -1,0 +1,34 @@
+# Edit this file, or pass --config with a partial/full YAML override.
+# Paths below are relative to the checkout root, not this YAML's directory.
+task: Plug in the Ethernet cable
+max_steps: null  # Actual Robot.send_action calls; null means continuous until Ctrl-C.
+
+robot:
+  mode: 3  # 1: joint position; 3: joint impedance. Mode 2 does not accept joint targets.
+  velocity_ratio: null  # Optional controller percentage [0, 100]; null leaves it unchanged.
+  node_name: phyai_tianji_robot
+  service_timeout_s: 3.0  # Per-service availability and response timeout.
+  io_timeout_s: 0.1  # CompositeRobot backend read/write/stop timeout.
+
+adapter:
+  metadata_file: null  # Relative to checkpoint; null discovers deployment metadata.
+  gripper_limits_rad: [0.0, 1.6]  # Closed/open motor positions; set to actual hardware calibration.
+
+policy:
+  checkpoint: ???  # Required: local converted pi0.5 weights, tokenizer, stats and metadata.
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+  seed: 42  # CPU diffusion-noise stream; a fresh sample is drawn for each prediction.
+  use_cuda_graph: true
+  num_threads: 16  # PhyAI runtime CPU thread count, not ROS callback threads.
+
+deployment:
+  action_hz: 25.0  # Source-model targets: 40 ms between adjacent actions.
+  control_hz: 200.0  # Interpolated complete robot commands: nominal 5 ms intervals.
+  execution_horizon: 20  # Execute this prefix of the model's 50 predicted targets.
+  max_queued_actions: 20  # Source-target capacity; must cover execution_horizon.
+  max_sample_age_s: 0.5  # Oldest allowed locally received sample at snapshot time.
+  startup_timeout_s: 10.0  # Wait for first executable prediction after enabling control.
+  observation_timeout_s: 10.0  # Wait for a complete/fresh snapshot before each prediction.
+  max_prediction_age_s: 2.0  # Snapshot-to-send age, including inference and execution.
+  shutdown_timeout_s: 2.0  # Wait for in-flight inference after robot stop/close.
+  max_control_lateness_s: 0.01  # Allow at most 10 ms past a scheduled control tick.

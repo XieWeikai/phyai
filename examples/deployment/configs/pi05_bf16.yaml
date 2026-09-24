@@ -1,0 +1,26 @@
+# Static BF16 deployment with exact GELU semantics for the pi0.5 MLPs.
+# These overrides preserve checkpoint inference behavior rather than silently
+# substituting a tanh-approximate GELU implementation.
+schema: phyai.kernel/v1
+profile: static
+defaults:
+  fallback: error
+overrides:
+  - id: pi05-exact-geglu
+    priority: 100
+    match:
+      op: activation
+      model.family: pi05
+      attrs:
+        activation: gelu
+        gated: true
+    use: flashinfer.activation.gelu_and_mul
+  - id: pi05-exact-gelu
+    priority: 100
+    match:
+      op: activation
+      model.family: pi05
+      attrs:
+        activation: gelu
+        gated: false
+    use: torch.activation.gelu
