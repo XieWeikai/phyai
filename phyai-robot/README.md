@@ -269,49 +269,51 @@ this snapshot. The example predicts absolute targets, so it needs no such additi
 
 ### 4. Run the control loop
 
-The example configures `RobotDeployment` for 20 Hz, starts refilling when four
-or fewer commands remain, and caps the queue at sixteen commands. With
-`--steps 30`, `run(max_steps=30)` connects the robot, sends thirty commands, then
-stops and closes both backends.
+The example uses 20 Hz model targets and a 20 Hz control loop, with room for
+sixteen source targets. With `--steps 30`, `run(max_steps=30)` connects the robot,
+sends thirty commands, then stops and closes both backends.
 
-The control thread owns Robot I/O. A background producer calls the adapter and
-policy, allowing the control thread to keep sending queued actions during inference:
+The producer waits for an empty queue, reads an observation, runs inference,
+and enqueues the retained prefix. The independent control loop interpolates
+source targets at `control_hz`. **It sends nothing while the queue is empty.**
+Observation and inference never run on the control tick, and the next snapshot
+is not read until the previous chunk's last interval and send have finished.
 
 ```mermaid
 sequenceDiagram
     participant R as Robot
     participant L as Control thread
-    participant Q as Action queue
-    participant W as Producer thread
+    participant Q as Source action queue
+    participant W as Observation/policy worker
     participant P as Policy
     L->>R: connect()
-    L->>R: get_observation()
-    R-->>L: Observation
-    L-->>W: Share latest snapshot
-    Note over L,W: Startup waits for the first valid chunk while reading sensors
-    par Control ticks once actions are available
-        L->>R: get_observation()
-        R-->>L: Fresh snapshot
-        L-->>W: Update latest snapshot
-        L->>Q: Take next Action
-        Q-->>L: Action and snapshot time
-        L->>R: send_action(action)
-    and Refill when the queue is low and a new snapshot exists
+    loop Until max_steps, stop(), or failure
+        Note over L,W: Empty queue: control waits without sending
+        W->>R: get_observation() under I/O lock
+        R-->>W: Observation
         W->>W: adapter.to_request(snapshot)
         W->>P: predict(request)
         P-->>W: result
         W->>W: adapter.to_actions(result, same snapshot)
-        W->>W: Validate and resample ActionChunk
-        W->>Q: Append targets that fit
+        W->>Q: Validate, detach, enqueue execution_horizon source targets
+        Note over L,W: Worker waits until the queue completely drains
+        loop At control_hz for this chunk
+            L->>Q: Read neighboring source targets, retire consumed targets
+            L->>L: Interpolate continuous fields
+            L->>R: send_action(action) under I/O lock
+        end
+        L->>Q: Release final target after its interval; notify worker
     end
-    Note over L,P: Repeat until max_steps, stop(), or failure
     L->>R: stop() and close()
 ```
 
-The application owns the policy and any engine it wraps. Do not concurrently use
-the robot, adapter, or policy while deployment owns their calls. Use
-`deployment.stop()` to request termination from another thread; `run()` performs
-the hardware shutdown before returning. Construct new robot/backend and deployment instances for another run.
+A condition variable protects the queue and chunk metadata. An I/O lock prevents
+concurrent Robot reads, writes and shutdown; CompositeRobot needs no internal
+synchronization changes. The application owns the policy and engine. Do not use
+them or the robot concurrently while deployment owns their calls. Request
+termination from another thread with `deployment.stop()`; `run()` performs the
+hardware shutdown. Construct new robot/backend and deployment instances for
+another run.
 
 ## Control timing
 
@@ -319,36 +321,59 @@ Configure timing with [`DeploymentOptions`](src/phyai_robot/deployment.py):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `control_hz` | Required | Frequency of single-action submissions. |
-| `max_sample_age_s` | Required | Maximum local receive age of every required sensor field. |
-| `startup_timeout_s` | `5.0` | Time allowed after connection for complete observations and the first usable actions. |
-| `queue_low_watermark` | `10` | Predict when the queue has at most this many commands and a new snapshot is available. |
-| `max_queued_actions` | `50` | Maximum retained command count; must exceed the watermark. |
-| `max_prediction_age_s` | `0.5` | Maximum snapshot-to-send age, including inference and time spent queued. |
-| `shutdown_timeout_s` | `2.0` | Maximum wait for a still-running prediction after hardware shutdown. |
-| `interpolate_keys` | Empty | Floating-point action fields to interpolate linearly; other fields hold the preceding target. |
+| `control_hz` | Required | Single-action submission frequency while a chunk executes. |
+| `max_control_lateness_s` | `0.01` | Maximum allowed delay past a scheduled send, independent of `control_hz`; equality is allowed. |
+| `action_hz` | `None` | Source target frequency; `None` uses `ActionChunk.step_period_s`. |
+| `execution_horizon` | `None` | Number of source targets retained per prediction; `None` keeps the whole chunk. |
+| `max_queued_actions` | `50` | Capacity in source targets, not interpolated commands. An oversized retained prefix is rejected. |
+| `max_sample_age_s` | Required | Maximum receive age of every sensor at observation time. |
+| `startup_timeout_s` | `5.0` | Budget for the first complete observation and usable chunk. |
+| `observation_timeout_s` | `5.0` | Per-refill wait for complete, fresh sensor samples; no commands are sent while waiting. |
+| `max_prediction_age_s` | `0.5` | Snapshot-to-send limit, including inference and execution time. |
+| `shutdown_timeout_s` | `2.0` | Wait for in-flight prediction after hardware shutdown. |
+| `interpolate_keys` | Empty | Floating-point fields interpolated linearly; other fields hold the preceding target. |
 
-Choose freshness budgets that account for your sensors, model latency, and queue
-duration. Every required sensor must have a first sample before prediction can
-start. A local receive timestamp measures message arrival, not device capture
-time; it cannot establish synchronization or detect a device replaying old frames.
+There is no low-watermark refill or prefetch. The old `queue_low_watermark`
+option has been removed. Only one prediction runs at a time, and queue exhaustion
+is a normal pause, not a failure. Missing/stale sensors are retried only while
+idle, up to `observation_timeout_s`, without relaxing `max_sample_age_s`. A
+sensor timeout, expired prediction, backend/policy failure, or control lateness
+above `max_control_lateness_s` ends the run and attempts stop/close. The default
+allows up to 10 ms of lateness, including at 200 Hz (a 5 ms period). A late wakeup
+within this budget skips old control ticks and sends the latest due target, not
+an accumulated burst. The chunk clock and source-action timing are unchanged.
+Each new chunk gets a new clock, so waiting for observation/inference is not a
+missed control deadline. Timing errors include the actual lateness, limit,
+wakeup delay, I/O-lock wait, action-preparation time, and previous send duration.
+This is a host-side check before `send_action`, not a ROS delivery-time guarantee;
+it cannot interrupt a send already blocked inside a backend.
 
-Only one prediction runs at a time. New chunks append behind existing commands;
-when space is limited, only the new chunk's earliest targets are retained. A late
-prediction is discarded. A stale sensor, expired queued action, empty queue,
-backend or policy failure, or a missed complete control period ends the run and
-attempts stop/close. The loop does not send bursts to catch up with missed ticks.
+For a source period `dt` and retained horizon `N`, the execution interval is
+`[0, N * dt)`. For time `t`, linearly interpolate between targets
+`i = floor(t / dt)` and `i + 1`, with fraction `(t - i * dt) / dt`. Hold the final
+target over its last source interval; never interpolate toward a discarded tail.
+For `action_hz=25`, `control_hz=200`, and `execution_horizon=20`, twenty queue
+entries normally yield 160 sends over a nominal 0.8-second chunk. Skipped ticks
+reduce this count without stretching the trajectory. `max_steps` counts actual
+sends and may stop partway through a chunk. No commands are emitted during the following
+observation/inference gap.
 
-Deployment resamples a chunk's interval `[0, len(actions) * step_period_s)` at the
-control rate, holding its final target after the last source point. Interpolation
-applies only within a chunk and only to explicitly selected fields. It does not
-enforce velocity or acceleration limits. This loop uses FIFO append scheduling;
-it does not implement RTC or hard real-time control.
+Linear interpolation stays between adjacent endpoints, but does not impose
+velocity/acceleration limits or handle pose rotations. There is no interpolation
+across the inference gap, RTC, or hard real-time guarantee. The first source
+action is sent directly: an application requiring a measured-state ramp must
+provide one separately.
+
+Choose freshness budgets that include sensor age, model latency, and execution
+duration. Every required sensor needs a sample before prediction, even if the
+adapter ignores it. Sensors are **not reread during execution**. Receive time is
+not capture time and cannot establish sensor synchronization or detect replayed
+frames. Device-side limits and watchdogs remain necessary, especially because
+no host commands arrive during inference.
 
 A blocked predictor cannot be forcibly cancelled. If it exceeds the shutdown
-budget, `run()` reports the timeout after stopping hardware, and the producer
-discards its eventual result. Keep its engine resources alive until prediction
-has actually returned.
+budget, `run()` reports the timeout after stopping hardware and discards the
+worker's eventual result. Keep its engine alive until prediction has returned.
 
 ## Connect your robot
 

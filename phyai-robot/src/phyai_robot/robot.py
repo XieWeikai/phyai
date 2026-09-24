@@ -27,8 +27,9 @@ from .backends.base import Backend
 class Robot(Protocol):
     """Expose named observations and complete single-tick commands.
 
-    Robot I/O is owned by one caller (the Deployment actor). Neither this
-    interface nor CompositeRobot promises thread-safe concurrent read/write/stop.
+    Robot I/O must be serialized by the caller (RobotDeployment uses an I/O
+    lock). Neither this interface nor CompositeRobot promises thread-safe
+    concurrent read/write/stop.
     """
 
     @property

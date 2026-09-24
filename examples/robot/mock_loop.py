@@ -128,7 +128,7 @@ def main() -> None:
             control_hz=20,
             max_sample_age_s=0.5,
             max_prediction_age_s=2,
-            queue_low_watermark=4,
+            action_hz=20,  # Model targets have a configurable 50ms spacing.
             max_queued_actions=16,
         ),
     )
