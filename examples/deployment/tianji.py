@@ -90,6 +90,13 @@ Configuration reference
 * ``policy.kernel_policy``: kernel-selection YAML. The supplied BF16 static
   configuration preserves exact GELU/GEGLU semantics.
 * ``policy.seed``: CPU diffusion-noise seed; each prediction draws fresh noise.
+* ``policy.num_inference_steps``: positive number of flow-matching Euler updates
+  per prediction, or null to retain the checkpoint setting. For example,
+  ``policy.num_inference_steps=5`` overrides it from the CLI. The setting is
+  applied before time-embedding preparation and CUDA graph capture; restart the
+  deployment to change it. It does not change the 50-target action horizon,
+  execution_horizon, or action/control rates. Changing it can change predicted
+  trajectories; fewer steps do not guarantee equivalent robot behavior.
 * ``policy.use_cuda_graph``: enable engine graph capture/replay.
 * ``policy.num_threads``: PhyAI runtime CPU threads, not ROS executor threads.
 * ``deployment.action_hz``: source action rate, default 25 Hz (40 ms spacing).
@@ -174,9 +181,18 @@ DEFAULT_CONFIG = Path(__file__).with_name("configs") / "tianji.yaml"
 
 @dataclass
 class TianjiDeploymentConfig:
-    """Compose the schemas for this example; no device logic lives in the loader."""
+    """Compose independent settings into the YAML shape of this entry point.
 
+    The loader receives this type rather than importing Tianji-specific classes.
+    Each nested module owns its fields and validation; this root owns task text,
+    run length, and the cross-module execution-horizon check. default_factory
+    gives each parsed configuration its own nested objects and calibration list.
+    """
+
+    # The adapter injects this instruction into every model request.
     task: str = "Plug in the Ethernet cable"
+    # Counts actual complete Robot.send_action calls, not inference iterations
+    # or 25 Hz targets. None keeps refilling/executing until stopped or failed.
     max_steps: int | None = None
     robot: TianjiRobotConfig = field(default_factory=TianjiRobotConfig)
     adapter: TianjiPi05AdapterConfig = field(default_factory=TianjiPi05AdapterConfig)
@@ -189,6 +205,9 @@ class TianjiDeploymentConfig:
             raise ValueError("task must be non-empty")
         if self.max_steps is not None and self.max_steps < 1:
             raise ValueError("max_steps must be positive or null")
+        # Validate the adapter's model horizon against the loop's prefix length,
+        # then let DeploymentOptions check generic timing and queue constraints.
+        # None of these checks starts a ROS executor or loads the CUDA engine.
         self.robot.validate()
         self.adapter.validate(execution_horizon=self.deployment.execution_horizon)
         self.policy.validate()
@@ -196,21 +215,34 @@ class TianjiDeploymentConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Compose the deployment; device protocol and model layout live elsewhere."""
+    """Compose resources, discard warmup, enable control, then run until stopped.
+
+    Configuration errors fail before allocation. Once resources exist, ExitStack
+    also covers exceptions during connection, warmup, and service preparation.
+    RobotDeployment owns observation/inference and command-loop coordination;
+    this entry point must not add another publisher, queue, or timing thread.
+    """
     config = parse_config(
         TianjiDeploymentConfig,
         default_config=DEFAULT_CONFIG,
         argv=argv,
         validate=TianjiDeploymentConfig.validate,
     )
+    # All four action fields are continuous absolute positions (radians for
+    # arms, normalized fractions for grippers), so all may be interpolated.
+    # This choice belongs here, not in the hardware-independent config loader.
     options = config.deployment.to_options(interpolate_keys=ACTION_SCHEMA)
     checkpoint = repository_path(config.policy.checkpoint)
+    # Register each cleanup immediately after successful construction. LIFO
+    # cleanup leaves the service executor alive while robot.close requests idle.
     with ExitStack() as resources:
         control = TianjiControl(
             node_name=f"{config.robot.node_name}_control",
             service_timeout_s=config.robot.service_timeout_s,
         )
         resources.callback(control.close)
+        # Preprocessing metadata determines camera image_size. Load it before
+        # building the robot, so its cached images match the model's geometry.
         adapter = TianjiPi05Adapter(
             checkpoint,
             task=config.task,
@@ -221,6 +253,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             checkpoint,
             kernel_policy=repository_path(config.policy.kernel_policy),
             seed=config.policy.seed,
+            num_inference_steps=config.policy.num_inference_steps,
             use_cuda_graph=config.policy.use_cuda_graph,
             num_threads=config.policy.num_threads,
         )
@@ -237,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         deployment = RobotDeployment(
             robot=robot, policy=policy, adapter=adapter, options=options
         )
+        # Connection starts subscriptions and the service executor, not motion.
+        # TianjiControl is still read-only, including during failure cleanup.
         control.connect()
         robot.connect()
         observation = wait_for_observation(
@@ -244,12 +279,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             timeout_s=options.observation_timeout_s,
             max_age_s=options.max_sample_age_s,
         )
+        # Exercise the complete request -> engine -> action decode path before
+        # enabling user input. The first call may include graph capture; its old
+        # snapshot and targets must never enter the live execution queue.
         started = time.monotonic()
         warmup = adapter.to_actions(
             policy.predict(adapter.to_request(observation)), observation
         )
         print(
-            f"Warmup: {time.monotonic() - started:.3f}s; discarded {len(warmup.actions)} actions",
+            f"Warmup: {time.monotonic() - started:.3f}s; denoise_steps={policy.num_inference_steps}; discarded {len(warmup.actions)} actions",
             flush=True,
         )
         # Never execute warmup targets or enable control using stale startup
@@ -259,6 +297,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             timeout_s=options.observation_timeout_s,
             max_age_s=options.max_sample_age_s,
         )
+        # First mutating controller operations: ready -> mode -> optional speed
+        # ratio -> input=3. Stop/close will request input=0 after this opt-in.
         control.prepare_user_control(
             mode=config.robot.mode, velocity_ratio=config.robot.velocity_ratio
         )
@@ -266,6 +306,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"Tianji input=3, mode={config.robot.mode}; source={options.action_hz:g}Hz, control={options.control_hz:g}Hz, horizon={options.execution_horizon}, lateness<={options.max_control_lateness_s * 1000:g}ms; Ctrl-C stops",
             flush=True,
         )
+        # run owns the producer thread and independent control loop. When the
+        # source queue drains it obtains a new observation and predicts again;
+        # the control side sends nothing while that refill is in progress.
+        # Completion/errors stop and close the robot before waiting for inference.
         deployment.run(max_steps=config.max_steps)
 
 

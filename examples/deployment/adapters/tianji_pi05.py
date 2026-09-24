@@ -21,9 +21,14 @@ from numpy.typing import NDArray
 from ..policies import Pi05PolicyRequest
 from ..robots.tianji import ARM_DOF, GRIPPER_FEEDBACK_SIZE, resize_rgb
 
+# Dataset layout, shared by state and decoded actions:
+# [left joints 0:7, left gripper 7, right joints 8:15, right gripper 15].
+# Joint coordinates are radians; gripper coordinates are normalized positions.
 ACTION_DIM = 16
 ACTION_HORIZON = 50
 ACTION_PERIOD_S = 0.04  # Source targets are sampled at 25 Hz.
+# Default closed/open motor positions for the adapter's affine state mapping.
+# These are calibration inputs, not a discovered device limit or a safety bound.
 GRIPPER_LIMITS_RAD = (0.0, 1.6)
 
 
@@ -36,7 +41,10 @@ class TianjiPi05AdapterConfig:
     applies it locally without querying any external status service.
     """
 
+    # None uses unambiguous checkpoint discovery; relative names use checkpoint.
     metadata_file: str | None = None
+    # Both hands use this [closed, open] pair. ROS feedback remains in radians;
+    # only model state is converted to a fraction of this measured travel range.
     gripper_limits_rad: list[float] = field(
         default_factory=lambda: list(GRIPPER_LIMITS_RAD)
     )
@@ -82,6 +90,9 @@ def load_processor(
         metadata_path = candidates[0]
     metadata = json.loads(metadata_path.read_text())
     validate_metadata(metadata)
+    # The export names its statistics "state" and "actions"; the shared
+    # processor expects canonical observation.state and action feature names.
+    # Pass the local checkpoint as tokenizer source to use its vocabulary.
     stats = json.loads((checkpoint / "norm_stats.json").read_text())["norm_stats"]
     processor = PI05Processor(
         tokenizer_name=str(checkpoint),
@@ -119,6 +130,9 @@ def prepare_observation(
         image = np.asarray(payload[camera])
         if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
             raise ValueError(f"{camera} must be an RGB uint8 HWC image")
+        # HWC uint8 [0, 255] -> batched CHW float32 [0, 1]. Keep the three
+        # cameras as an ordered list: swapping hands is shape-correct but wrong
+        # for the learned policy. Further pixel normalization is processor-owned.
         padded = resize_rgb(image, processor.image_size)
         images.append(torch.from_numpy(padded).permute(2, 0, 1)[None].float() / 255.0)
     state = np.asarray(payload["state"], dtype=np.float32)
@@ -126,6 +140,9 @@ def prepare_observation(
         raise ValueError(
             f"Expected state shape {(metadata['action_dim'],)}, got {state.shape}"
         )
+    # Batch dimension is always one. Copy state so preprocessing cannot modify
+    # the paired observation that will later anchor the predicted joint deltas.
+    # The processor normalizes/tokenizes state together with the instruction.
     return processor.preprocess(
         {
             "images": images,
@@ -152,13 +169,23 @@ def absolute_actions(
     actions = processor.postprocess(
         normalized[..., : metadata["action_dim"]].float().cpu()
     )
+    # Broadcast one masked 16-value anchor across the whole horizon. Deltas
+    # are relative to the observed pose, not incremental changes to be summed
+    # over time. False mask entries (grippers) receive no state offset.
     anchor = torch.as_tensor(np.asarray(state), dtype=actions.dtype)
     mask = torch.tensor(metadata["delta_mask"], dtype=torch.bool)
     return actions + torch.where(mask, anchor, 0)[..., None, :]
 
 
 def validate_metadata(metadata: Mapping[str, Any]) -> None:
-    """Reject a checkpoint with a different state/action or camera convention."""
+    """Reject exports whose shapes are compatible but whose meaning differs.
+
+    Camera order and delta_mask are as important as the array dimensions. An
+    incompatible export must fail before control is enabled, rather than drive
+    an arm using another arm's coordinates. action_stride is an export-contract
+    check; runtime source-target spacing is controlled by DeploymentOptions.
+    norm_eps is retained from the export for matching normalization arithmetic.
+    """
     if not isinstance(metadata, Mapping):
         raise TypeError("checkpoint metadata must be a JSON object")
     expected = {
@@ -199,6 +226,13 @@ class TianjiPi05Adapter:
         metadata_file: str | None = None,
         gripper_limits_rad: tuple[float, float] = GRIPPER_LIMITS_RAD,
     ) -> None:
+        """Load preprocessing assets and bind one task plus gripper calibration.
+
+        checkpoint contains tokenizer, norm_stats.json, and validated metadata.
+        This creates no engine or ROS connection. image_size is exposed so the
+        robot factory can cache policy-sized RGB frames before snapshot copies.
+        Task text stays in the adapter: changing it does not change Robot's API.
+        """
         if not task.strip():
             raise ValueError("task must be non-empty")
         low, high = map(float, gripper_limits_rad)
@@ -217,6 +251,9 @@ class TianjiPi05Adapter:
         slight negative readings occur at the physical stop and in the dataset.
         Commands, unlike observations, are clamped to the valid [0, 1] range.
         """
+        # Only index 0 of each five-value gripper feedback vector is position.
+        # Velocity, torque, and temperatures remain available in Observation,
+        # but must not leak into this checkpoint's 16-dimensional state vector.
         values: list[NDArray[np.float32]] = []
         low, high = self._gripper_limits_rad
         for side in ("left", "right"):
@@ -228,6 +265,8 @@ class TianjiPi05Adapter:
                 raise ValueError(f"Invalid {side} arm/gripper state shape")
             grip = (float(feedback[0]) - low) / (high - low)
             values.extend((joints, np.asarray([grip], dtype=np.float32)))
+        # Append arm then gripper for each side, not both arms then both hands:
+        # the checkpoint's normalization statistics depend on this exact order.
         state = np.concatenate(values)
         if not np.isfinite(state).all():
             raise ValueError("Tianji policy state contains a non-finite value")
@@ -239,6 +278,9 @@ class TianjiPi05Adapter:
         The configured instruction is injected here, not stored in the Robot. The
         right eye is intentionally absent: head_left uses the left-eye camera.
         """
+        # Convert application-level sensor names to checkpoint camera names.
+        # EEF/wrench are deliberately not removed from the robot schema: another
+        # adapter can consume them without changing transport or control code.
         payload = {
             "head_left": observation.samples["head_camera"].value,
             "left_wrist": observation.samples["left_wrist_camera"].value,
@@ -266,6 +308,9 @@ class TianjiPi05Adapter:
                 f"Expected finite model actions with shape {expected}, "
                 f"got {values.shape}"
             )
+        # Validate all 50 targets before any prefix is queued. A malformed tail
+        # is still a broken prediction even when execution_horizon is only 20.
+        # Copy each arm slice to detach commands from the shared model tensor.
         actions: list[Action] = []
         for target in values[0]:
             actions.append(
@@ -284,4 +329,7 @@ class TianjiPi05Adapter:
                     ),
                 }
             )
+        # These are source-rate targets, not 200 Hz sends. The deployment owns
+        # prefix selection, its thread-safe queue, and interpolation. A configured
+        # action_hz overrides this nominal checkpoint period of 40 ms.
         return ActionChunk(tuple(actions), ACTION_PERIOD_S)

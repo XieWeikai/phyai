@@ -74,6 +74,12 @@ class DualArmAdapter:
 
 
 def main() -> None:
+    """Run a bounded CPU-only deployment using independent in-memory backends.
+
+    No ROS node, checkpoint, or physical robot is used. MockBackend copies target
+    values directly into mapped feedback fields, so this checks composition and
+    shutdown behavior rather than robot dynamics or real-time performance.
+    """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--steps",
@@ -131,6 +137,9 @@ def main() -> None:
             max_queued_actions=16,
         ),
     )
+    # run connects the robot and owns both stop and close on completion/failure.
+    # Here action_hz equals control_hz, so each of the eight targets yields one
+    # send before the next observation/inference cycle refills the empty queue.
     deployment.run(max_steps=args.steps)
     print(f"Completed {arm_backend.write_count} steps; both backends stopped.")
 

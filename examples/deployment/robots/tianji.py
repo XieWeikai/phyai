@@ -4,6 +4,12 @@ This module owns the embodiment contract, not model inference or a control loop.
 Each action is a complete, one-shot publication. RobotDeployment owns repetition
 and interpolation; CompositeRobot owns schema validation and backend stop/close.
 A separate camera backend keeps image conversion off the command worker.
+
+Data flow is ROS message -> decoder -> cached Sample -> Observation, and complete
+Action -> schema/device validation -> encoder -> one ROS publication per field.
+The factory below is the single table of topic bindings. This module preserves
+EEF/wrench and raw gripper feedback even when a policy adapter ignores them.
+No task text, checkpoint normalization, or execution horizon belongs here.
 """
 
 from __future__ import annotations
@@ -45,6 +51,8 @@ MODE_CARTESIAN_IMPEDANCE = 2
 MODE_JOINT_IMPEDANCE = 3
 
 JOINT_NAMES = tuple(f"joint_{index}" for index in range(1, ARM_DOF + 1))
+# Preserve PoseStamped's xyzw quaternion convention. These decoders do not
+# transform reference frames; values stay in the frame used by each publisher.
 EEF_NAMES = ("x", "y", "z", "qx", "qy", "qz", "qw")
 WRENCH_NAMES = ("fx", "fy", "fz", "tx", "ty", "tz")
 GRIPPER_FEEDBACK_NAMES = (
@@ -112,10 +120,17 @@ class TianjiRobotConfig:
     Model normalization and control-loop timing are configured elsewhere.
     """
 
+    # The example sends joint targets. Cartesian mode 2 is a valid controller
+    # mode, but it is incompatible with these action fields and is rejected here.
     mode: int = MODE_JOINT_IMPEDANCE
+    # None leaves the existing device ratio untouched; this is not a host-side
+    # trajectory limit, collision check, or control-frequency setting.
     velocity_ratio: int | None = None
+    # The camera and control helpers derive distinct ROS node names from this.
     node_name: str = "phyai_tianji_robot"
+    # Availability and response each receive this budget for every service call.
     service_timeout_s: float = 3.0
+    # Bound backend operations. This is independent of the nominal 5 ms send tick.
     io_timeout_s: float = 0.1
 
     def validate(self) -> None:
@@ -149,6 +164,13 @@ class TianjiControl:
         service_timeout_s: float = 3.0,
         read_only: bool = True,
     ) -> None:
+        """Store connection settings without importing ROS or changing hardware.
+
+        read_only defaults to True so connect/close during initialization does
+        not change controller input. prepare_user_control explicitly clears it
+        before the first mutating call. A False value permits direct service use;
+        it does not by itself select a mode or start publishing commands.
+        """
         if service_timeout_s <= 0:
             raise ValueError("service_timeout_s must be positive")
         self._read_only = read_only
@@ -162,7 +184,13 @@ class TianjiControl:
         self._closed = False
 
     def connect(self) -> None:
-        """Start the private ROS executor and create Tianji service clients."""
+        """Create service clients and start a private executor, without enabling.
+
+        Repeated calls while connected are harmless; a closed helper cannot be
+        reopened. ROS/message imports happen here, so importing the configuration
+        classes does not require the ROS Python environment to be initialized.
+        The background executor handles service responses while the caller waits.
+        """
         if self._closed:
             raise RuntimeError("TianjiControl is closed")
         if self._thread is not None:
@@ -206,6 +234,8 @@ class TianjiControl:
             )
             self._thread.start()
         except BaseException:
+            # Construction can fail before the background thread is usable.
+            # Release only resources created here, including on KeyboardInterrupt.
             if executor is not None:
                 executor.shutdown()
             if node is not None:
@@ -214,6 +244,11 @@ class TianjiControl:
             raise
 
     def _spin(self) -> None:
+        """Run callbacks in the helper thread and retain executor failures.
+
+        Exceptions cannot propagate directly across threads. Subsequent service
+        calls check _spin_error and report the original exception as their cause.
+        """
         try:
             assert self._executor is not None
             self._executor.spin()
@@ -221,12 +256,21 @@ class TianjiControl:
             self._spin_error = error
 
     def _require_connected(self) -> None:
+        """Reject calls on a closed, unstarted, or failed service executor."""
         if self._closed or self._thread is None:
             raise RuntimeError("TianjiControl is not connected")
         if self._spin_error is not None:
             raise RuntimeError("Tianji ROS executor stopped") from self._spin_error
 
     def _call(self, client: Any, request: Any) -> Any:
+        """Wait for one mutating service and return its successful response.
+
+        Availability and response waits have separate service_timeout_s budgets;
+        this is not a single shared end-to-end deadline. A timeout cancels local
+        waiting but cannot undo a request the controller may already have applied.
+        Callers must let the normal robot stop/close path handle partial setup.
+        A negative success response or missing response raises RuntimeError.
+        """
         if self._read_only:
             raise RuntimeError("Read-only TianjiControl cannot call mutating services")
         self._require_connected()
@@ -253,6 +297,7 @@ class TianjiControl:
 
     @staticmethod
     def _integer_request(value: int) -> Any:
+        """Encode the shared mode/input/velocity service payload as Int.data."""
         from marvin_msgs.srv import Int
 
         request = Int.Request()
@@ -266,7 +311,12 @@ class TianjiControl:
         return self._call(self._ready_client, Trigger.Request())
 
     def set_mode(self, mode: int) -> Any:
-        """Set Tianji mode: 1 position, 2 Cartesian impedance, 3 joint impedance."""
+        """Set the controller algorithm without changing the selected input path.
+
+        Service values are 1 joint position, 2 Cartesian impedance, and 3 joint
+        impedance. This low-level helper supports all three, but the joint-action
+        deployment configuration deliberately allows only 1 or 3.
+        """
         if mode not in {
             MODE_JOINT_POSITION,
             MODE_CARTESIAN_IMPEDANCE,
@@ -276,7 +326,12 @@ class TianjiControl:
         return self._call(self._mode_client, self._integer_request(mode))
 
     def set_input(self, input_mode: int) -> Any:
-        """Select the command mux input; 3 is User/Custom and 0 is idle."""
+        """Select User/Custom input 3 or idle input 0 without changing mode.
+
+        Input 3 routes /tj/control/user/joint_cmd_A and joint_cmd_B to the joint
+        controller. Selecting idle is not a request for zero-valued joint angles.
+        This service is separate from the scalar gripper command topics.
+        """
         if input_mode not in {INPUT_IDLE, INPUT_USER}:
             raise ValueError(f"unsupported Tianji input mode: {input_mode}")
         return self._call(self._input_client, self._integer_request(input_mode))
@@ -293,7 +348,14 @@ class TianjiControl:
         mode: int = MODE_JOINT_IMPEDANCE,
         velocity_ratio: int | None = None,
     ) -> None:
-        """Set ready, mode, optional velocity, and User/Custom input in order."""
+        """Set ready, mode, optional velocity, and User/Custom input in order.
+
+        The entry point calls this only after discarded warmup and a fresh
+        observation. Input is selected last so new user joint targets are routed
+        only after the intended mode has been requested. Calls are not a device
+        transaction: a later failure can leave earlier settings applied.
+        Clearing read_only first allows cleanup to request idle in that case.
+        """
         # Explicit opt-in: read-only sessions do not mutate controller state,
         # even when CompositeRobot closes its backend.
         self._read_only = False
@@ -308,13 +370,22 @@ class TianjiControl:
 
         Ros2Backend invokes its ``on_stop`` callback on the backend worker.
         The callback is intentionally small and does not publish a fake zero
-        action: Tianji's input mux is the device-level safe-state mechanism.
+        action: returning the input mux to idle disables the user joint path.
+        It does not home the arms, restore the previous mode/velocity ratio, or
+        issue a new gripper target. It is not a physical emergency stop. _node is
+        the backend callback argument; this helper uses its own service executor.
         """
         if not self._read_only:
             self.set_input(INPUT_IDLE)
 
     def close(self) -> None:
-        """Release only this helper's ROS context; do not call global shutdown."""
+        """Release only this helper's ROS context; do not call global shutdown.
+
+        This method does not replace robot.stop: the caller must stop/close the
+        robot first, while these service clients still exist. Repeated close is
+        harmless. Joining the private executor thread is bounded; a thread that
+        remains alive after the timeout is reported rather than silently ignored.
+        """
         if self._closed:
             return
         self._closed = True
@@ -335,6 +406,13 @@ class TianjiControl:
 
 
 def _decode_image(message: Any) -> NDArray[np.uint8]:
+    """Decode the fixed Tianji NV12 layout into an owned HWC uint8 RGB array.
+
+    Accept only the native height/width and tightly packed 1.5-byte-per-pixel
+    payload used by these topics. This is not a general sensor_msgs/Image
+    decoder: other encodings, strides, and resolutions need an explicit update.
+    Shape/payload errors fail the observation path rather than reshaping junk.
+    """
     # sensor_msgs/Image carries NV12 as a Y plane followed by an interleaved
     # half-resolution UV plane.  We keep the ROS message buffer read-only and
     # return a detached RGB array, as required by phyai-robot snapshots.
@@ -366,6 +444,11 @@ def _decode_image(message: Any) -> NDArray[np.uint8]:
 
 @lru_cache(maxsize=1)
 def _load_cv2() -> Any | None:
+    """Cache the optional OpenCV import, including an unavailable result.
+
+    ImportError selects the NumPy path. Caching avoids retrying an unavailable
+    module for every frame; conversion failures are handled by _decode_image.
+    """
     try:
         import cv2
     except ImportError:
@@ -376,6 +459,13 @@ def _load_cv2() -> Any | None:
 def _decode_nv12_numpy(
     frame: NDArray[np.uint8], height: int, width: int
 ) -> NDArray[np.uint8]:
+    """Expand NV12 chroma and apply a simple full-range YUV-to-RGB conversion.
+
+    Each interleaved U/V pair covers a 2x2 luma block. Nearest repetition restores
+    full resolution, then clipping produces an HWC uint8 array. This fallback's
+    color arithmetic is not guaranteed to match OpenCV's conversion bit-for-bit;
+    use the normal OpenCV path when matching deployed image preprocessing.
+    """
     y_plane = frame[:height].astype(np.float32)
     uv_plane = frame[height:].reshape((height // 2, width // 2, 2))
     u = np.repeat(np.repeat(uv_plane[:, :, 0], 2, axis=0), 2, axis=1)
@@ -388,6 +478,11 @@ def _decode_nv12_numpy(
 
 
 def _decode_joint(message: Any, side: int) -> NDArray[np.float64]:
+    """Extract seven radians from arm_positions; side 0 is left, 1 is right.
+
+    The factory fixes side through its bindings. Copy the selected half so a
+    cached observation never aliases the incoming message's backing array.
+    """
     # Tianji publishes both arms in one Jointfeedback message.  The velocity
     # and effort arrays are deliberately ignored; only arm_positions are part
     # of this robot's observation contract.
@@ -403,6 +498,11 @@ def _decode_joint(message: Any, side: int) -> NDArray[np.float64]:
 
 
 def _decode_eef(message: Any) -> NDArray[np.float64]:
+    """Preserve pose values as [x, y, z, qx, qy, qz, qw], without frame conversion.
+
+    The header is not part of this array. Local receive timing is tracked in the
+    backend's Sample independently of the publisher's ROS timestamp.
+    """
     # Convert geometry_msgs/PoseStamped to the stable seven-element layout
     # documented by OBSERVATION_SCHEMA.
     pose = message.pose
@@ -421,6 +521,7 @@ def _decode_eef(message: Any) -> NDArray[np.float64]:
 
 
 def _decode_wrench(message: Any) -> NDArray[np.float64]:
+    """Preserve [fx, fy, fz, tx, ty, tz] without filtering or frame conversion."""
     # WrenchStamped is flattened as force xyz followed by torque xyz.
     wrench = message.wrench
     return np.asarray(
@@ -437,6 +538,11 @@ def _decode_wrench(message: Any) -> NDArray[np.float64]:
 
 
 def _decode_gripper_feedback(message: Any) -> NDArray[np.float32]:
+    """Copy all five raw feedback values; do not normalize motor position here.
+
+    Position-to-model calibration belongs to the adapter. Retaining velocity,
+    torque, and temperatures does not make them inputs to the current policy.
+    """
     # Float32MultiArray order is position, velocity, torque, MOS temperature,
     # and motor temperature, as documented by the Tianji interface.
     values = np.asarray(message.data, dtype=np.float32)
@@ -449,12 +555,22 @@ def _decode_gripper_feedback(message: Any) -> NDArray[np.float32]:
 
 
 def _stamp_header(header: Any) -> None:
+    """Stamp an outgoing command with wall-clock seconds and nanoseconds.
+
+    The deployment's deadlines/freshness use a separate monotonic clock. This
+    helper neither reads simulated ROS time nor supplies a trajectory timestamp.
+    """
     stamp_ns = time.time_ns()
     header.stamp.sec = stamp_ns // 1_000_000_000
     header.stamp.nanosec = stamp_ns % 1_000_000_000
 
 
 def _encode_joint(values: NDArray[Any]) -> Any:
+    """Encode seven absolute radian targets; no velocity/effort target is set.
+
+    CompositeRobot already validates shape/dtype before this callback. Only the
+    header and positions are assigned; other message fields retain their defaults.
+    """
     from marvin_msgs.msg import JointcmdArm
 
     # RosCommand.encode is called once per complete CompositeRobot action.
@@ -467,6 +583,11 @@ def _encode_joint(values: NDArray[Any]) -> Any:
 
 
 def _encode_gripper(values: NDArray[Any]) -> Any:
+    """Encode a normalized target (0 closed, 1 open) as one Float32 message.
+
+    Conversion to physical motor travel is handled by the device-side gripper
+    controller. This encoder does not multiply by the adapter's radian limits.
+    """
     from std_msgs.msg import Float32
 
     # The schema uses shape (1,) so the action remains an array like every
@@ -477,6 +598,12 @@ def _encode_gripper(values: NDArray[Any]) -> Any:
 
 
 def _make_reliable_qos() -> Any:
+    """Build reliable, volatile, keep-last QoS for the matching topic bindings.
+
+    Reliability is a DDS delivery setting, not an acknowledgement that a motor
+    reached its target. Volatile durability does not replay historical commands
+    to newly joined subscribers.
+    """
     # EEF and gripper feedback publishers were observed with reliable QoS; a
     # matching profile prevents DDS endpoint incompatibility.  Cameras, joint
     # feedback, and wrench data use qos_profile_sensor_data below.
@@ -491,6 +618,11 @@ def _make_reliable_qos() -> Any:
 
 
 def _validate_action(action: Action) -> None:
+    """Reject out-of-range gripper targets before a complete action is published.
+
+    This is not a collision or joint-limit checker. The controller and operator
+    remain responsible for physical workspace and robot limits.
+    """
     # CompositeRobot has already checked completeness, shapes, dtypes, and
     # finite values.  This guard adds the device-specific normalized gripper
     # range before Ros2Backend publishes anything.
@@ -507,6 +639,10 @@ def resize_rgb(image: NDArray[np.uint8], size: int) -> NDArray[np.uint8]:
     camera frames. This only changes image geometry; model normalization and
     tokenization remain in the adapter. The same operation is used for any
     non-resized image passed directly to the adapter.
+
+    The longest side becomes size; the shorter side keeps its aspect ratio after
+    integer rounding. Unused pixels are zero (black), not stretched image data.
+    Input/output are HWC uint8 RGB arrays. The returned array owns its storage.
     """
     from PIL import Image
 
@@ -534,6 +670,19 @@ def make_tianji_robot(
     feedback remain in Observation. Only images are resized to image_size.
     The caller must keep control connected until after robot.stop/close so the
     command backend can request input=0 during shutdown.
+
+    Args:
+        control: Service helper used only by the command backend's stop callback.
+        node_name: Base ROS node name; the image backend adds a _cameras suffix.
+        io_timeout_s: Backend read/write/stop budget, not a publication interval.
+        image_size: Positive square RGB size cached by camera decoders. Raw topic
+            dimensions remain fixed; only the exposed image schema is replaced.
+
+    Returns:
+        An unconnected CompositeRobot with separate image and command backends.
+        connect, get_observation, send_action, stop, and close retain the standard
+        phyai-robot contract. Each send includes both arms and both grippers;
+        publications are not an atomic multi-topic device transaction.
     """
     from rclpy.qos import qos_profile_sensor_data
     from std_msgs.msg import Float32, Float32MultiArray
@@ -546,6 +695,7 @@ def make_tianji_robot(
         raise ValueError("image_size must be a positive integer")
 
     def image_decoder(message: Any) -> NDArray[np.uint8]:
+        """Cache policy-sized RGB frames on the image backend, not during sends."""
         return resize_rgb(_decode_image(message), image_size)
 
     # Each mapping key is a phyai-robot field.  Ros2Backend owns one ROS
@@ -614,6 +764,9 @@ def make_tianji_robot(
     # Each action mapping is one publisher and one encoder.  CompositeRobot
     # validates the full action first, then Ros2Backend publishes each of these
     # four messages exactly once in the caller's control tick.
+    # A/B are the left/right arm channels. Each encoder is called once for a
+    # complete send_action, including both gripper encoders at that same rate.
+    # There is no hidden gripper timer, arm resend thread, or partial-action path.
     actions = {
         "joint_position_left": RosCommand(
             "/tj/control/user/joint_cmd_A",
@@ -638,8 +791,13 @@ def make_tianji_robot(
     # The device-specific stop callback is kept outside Ros2Backend's topic
     # publishing path.  CompositeRobot.stop() invokes it before the backend
     # releases its ROS context.
+    # Copy the public native-image schema so multiple factories with different
+    # image_size values do not mutate each other's declared observation contract.
     schema = dict(OBSERVATION_SCHEMA)
     camera_keys = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+    # Image decoding can be costly. Its own backend keeps those callbacks off
+    # the backend worker that services command writes and non-image feedback.
+    # CompositeRobot still merges both caches into one validated Observation.
     backends = [
         Ros2Backend(
             observations={key: observations.pop(key) for key in camera_keys},
@@ -670,7 +828,15 @@ def make_tianji_robot(
 def wait_for_observation(
     robot: CompositeRobot, *, timeout_s: float = 10.0, max_age_s: float | None = None
 ) -> Observation:
-    """Wait for every field, optionally requiring fresh samples after model warmup."""
+    """Wait for a complete Observation, optionally enforcing local receive age.
+
+    This polls backend caches; it does not publish actions or select a mode.
+    max_age_s=None checks completeness only. Otherwise every field, including
+    EEF/wrench not used by this policy, must pass the same freshness limit.
+    Only not-ready/timeout failures are retried; malformed sensor values and
+    other backend errors propagate immediately. timeout_s bounds the retry loop,
+    while each individual read has its own backend I/O timeout.
+    """
     if timeout_s <= 0:
         raise ValueError("timeout_s must be positive")
     deadline = time.monotonic() + timeout_s
@@ -692,7 +858,13 @@ def wait_for_observation(
 
 
 def _check_observation_age(observation: Observation, max_age_s: float = 0.5) -> None:
-    """Reject missing/stale data before warming up or enabling the controller."""
+    """Check a complete snapshot's receive ages before warmup/control activation.
+
+    received_at_ns belongs to the host monotonic clock, not a message's ROS
+    header. Comparing clocks from different domains would give meaningless ages.
+    Future timestamps and samples older than max_age_s are both rejected. Fresh
+    per-field samples do not imply that all sensors captured at the same instant.
+    """
     now = time.monotonic_ns()
     for key, sample in observation.samples.items():
         if not 0 <= now - sample.received_at_ns <= max_age_s * 1e9:
