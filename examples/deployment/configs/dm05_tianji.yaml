@@ -1,0 +1,23 @@
+# OpenDM full-weight export: config, safetensors, Gemma3 processor and tokenizer.
+task: Put the green block on the blue block
+endpoint: tcp://127.0.0.1:5555
+lease_timeout_s: 60.0
+policy:
+  checkpoint: ???
+  seed: 42
+  num_inference_steps: 10
+  num_threads: 8
+processor:
+  norm_stats: ???
+  camera_names: [head_left, left_wrist, right_wrist]
+  image_prompts: [Head left, Left wrist, Right wrist]
+  robot_type: Marvin Pro
+  control_mode: joint
+  speed: "0.5"
+  # Joint deltas; grippers remain absolute. Both use the SFT state ordering.
+  delta_mask: [true, true, true, true, true, true, true, false, true, true, true, true, true, true, true, false]
+  wire_image_size: 960
+  history_camera: head_left
+  history_slots: 32
+  history_interval_s: 1.0
+  history_tolerance_s: 0.25

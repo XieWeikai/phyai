@@ -1,0 +1,9 @@
+# Merged over the existing Tianji client defaults; no separate control loop.
+remote:
+  endpoint: tcp://127.0.0.1:5555
+  timeout_s: 30.0
+  warmup_timeout_s: 180.0
+schedule:
+  strategy: stop_and_refill
+  action_hz: 50.0
+  execution_horizon: 20
