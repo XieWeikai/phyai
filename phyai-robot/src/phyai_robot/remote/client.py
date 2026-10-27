@@ -28,7 +28,7 @@ from __future__ import annotations
 import time
 from typing import Any, NamedTuple
 from contextlib import ExitStack
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from ..robot import Robot, wait_for_observation
 from ..policy import PolicyAdapter
@@ -63,6 +63,8 @@ def run_remote(
     options: DeploymentOptions,
     max_steps: int | None = None,
     report: Callable[[str], None] = lambda message: None,
+    run_options: Mapping[str, Any] | None = None,
+    on_deployment: Callable[[RobotDeployment], None] | None = None,
 ) -> None:
     """Execute a complete robot deployment session against a remote policy server.
 
@@ -110,9 +112,18 @@ def run_remote(
             scheduler=scheduler,
             options=options,
         )
+        if on_deployment is not None:
+            on_deployment(deployment)
+        if deployment.stopped:
+            return
 
         # Step 5 & 6: Reserve model run and connect robot transports.
-        policy.begin_run()
+        if run_options is None:
+            policy.begin_run()
+        else:
+            policy.begin_run(run_options)
+        if deployment.stopped:
+            return
         robot.connect()
 
         def fresh_observation():
@@ -124,10 +135,14 @@ def run_remote(
 
         # Step 7: Wait for all sensors to deliver complete, fresh data frames.
         observation = fresh_observation()
+        if deployment.stopped:
+            return
 
         # Step 8: Execute first warmup inference forward pass and discard output.
         started = time.monotonic()
         result = policy.warmup(adapter.to_request(observation, InferenceContext()))
+        if deployment.stopped:
+            return
         warmup = deployment.prepare_chunk(adapter.to_actions(result, observation))
         report(
             f"Warmup took {time.monotonic() - started:.3f}s; "
@@ -136,10 +151,15 @@ def run_remote(
 
         # Step 9: Re-verify sensor freshness after warmup delay.
         fresh_observation()
+        if deployment.stopped:
+            return
 
         # Step 10: Enable controller actuator command routing.
         if embodiment.activate is not None:
-            embodiment.activate()
+            if not deployment.activate(embodiment.activate):
+                return
+        if deployment.stopped:
+            return
 
         report("Robot commands enabled; Ctrl-C stops")
 

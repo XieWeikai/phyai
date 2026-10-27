@@ -63,7 +63,11 @@ def main() -> None:
             p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (wheel, archive)
         },
         wheel_version=version,
-        profiles=["agilex-humble-py310-x86_64", "tianji-jazzy-py312-aarch64"],
+        profiles=[
+            "agilex-humble-py310-x86_64",
+            "arx-jazzy-py312-x86_64",
+            "tianji-jazzy-py312-aarch64",
+        ],
     )
     (out / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(out)

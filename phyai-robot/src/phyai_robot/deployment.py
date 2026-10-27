@@ -140,6 +140,18 @@ class RobotDeployment(Generic[RequestT, ResultT]):
         self._worker_error: BaseException | None = None
         self._started = False
 
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    def activate(self, callback) -> bool:
+        """Serialize an application's activation hook with the stop barrier."""
+        with self._io_lock:
+            if self.stopped:
+                return False
+            callback()
+            return not self.stopped
+
     def stop(self) -> None:
         """Request immediate shutdown. Guarantees no new Robot I/O begins after returning.
 
@@ -184,8 +196,10 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                 # Wait until the scheduler indicates it is ready for a new prediction.
                 with self._condition:
                     self._condition.wait_for(
-                        lambda: self._stop_event.is_set()
-                        or self.scheduler.wants_inference()
+                        lambda: (
+                            self._stop_event.is_set()
+                            or self.scheduler.wants_inference()
+                        )
                     )
                     if self._stop_event.is_set():
                         return

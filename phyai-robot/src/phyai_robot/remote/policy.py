@@ -197,14 +197,16 @@ class RemotePolicy:
             result, _ = self._rpc("info")
             return PolicySpec.from_dict(result["spec"])
 
-    def begin_run(self) -> PolicySpec:
+    def begin_run(self, options: Mapping[str, Any] | None = None) -> PolicySpec:
         """Reserve server run, reset RNG noise stream, and receive validated PolicySpec."""
         with self._lock:
             self._ensure_open()
             if self._run_id is not None:
                 raise RuntimeError("this client already owns a run")
             try:
-                response, _ = self._rpc("begin")
+                response, _ = self._rpc(
+                    "begin", {"options": dict(options)} if options is not None else None
+                )
                 run_id = response.get("run_id")
                 if not isinstance(run_id, str) or not run_id:
                     raise RemotePolicyError("missing server run ID")
@@ -304,6 +306,7 @@ class PolicyServer:
         reset_run: Callable[[], None],
         endpoint: str = "tcp://127.0.0.1:5555",
         lease_timeout_s: float = 60.0,
+        configure_run: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         """Initialize PolicyServer.
 
@@ -319,6 +322,7 @@ class PolicyServer:
         self.policy, self.spec = policy, spec
         self.reset_run, self.endpoint = reset_run, endpoint
         self.lease_timeout_s = lease_timeout_s
+        self.configure_run = configure_run
         self._run_id: str | None = None
         self._last_request_id = -1
         self._warmed = False
@@ -361,6 +365,11 @@ class PolicyServer:
                     "server already has an active run; wait for it to end or for "
                     f"its {self.lease_timeout_s:g} s lease to expire"
                 )
+            options = request.get("options")
+            if options is not None:
+                if not isinstance(options, dict) or self.configure_run is None:
+                    raise ValueError("server does not accept these run options")
+                self.configure_run(options)
             self.reset_run()
             self._run_id, self._warmed = uuid.uuid4().hex, False
             self._last_request_id = request_id

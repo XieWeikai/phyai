@@ -41,6 +41,7 @@ config, not changing the server.
 | Robot | Model inputs | Action row |
 |---|---|---|
 | AgileX | `image.front`, `image.left`, `image.right`, 14-D state | left 6 joints (rad), left gripper (m), right 6 joints, right gripper |
+| [ARX X5 2025 / AC One](ARX.md) | `image.base`, `image.left_wrist`, `image.right_wrist`, 14-D state | left 6 joints, raw gripper, right 6 joints, raw gripper; all radians |
 | Tianji | `image.head_left`, `image.left_wrist`, `image.right_wrist`, 16-D state | left 7 joints (rad), left gripper, right 7 joints, right gripper (normalized) |
 
 Tianji gripper state is the feedback position mapped from
@@ -157,6 +158,7 @@ prints configuration without importing the selected factory or loading weights.
 | Profile | Native interpreter | ROS / overlays | Important pins |
 |---|---|---|---|
 | `agilex-humble-py310-x86_64` | `/usr/bin/python3`, 3.10 | Humble, `sensor_msgs` | NumPy 1.26.4, Pillow 12.3.0 |
+| `arx-jazzy-py312-x86_64` | `/usr/bin/python3`, 3.12 | Jazzy, `arx5_arm_msg`, `sensor_msgs`, `std_srvs` | NumPy 1.26.4, Pillow 12.3.0 |
 | `tianji-jazzy-py312-aarch64` | `/usr/bin/python3`, 3.12 | Jazzy, `marvin_msgs`, `sensor_msgs`, `geometry_msgs`, `std_msgs`, `std_srvs` | NumPy 2.5.3, Pillow 12.3.0, PyAV 18.1.0, OpenCV 5.0.0.93 |
 
 Each directory under `environments/` holds pinned inputs and a hash-locked

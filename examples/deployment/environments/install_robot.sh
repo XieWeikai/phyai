@@ -8,6 +8,7 @@ profile=${1:?Usage: install_robot.sh PROFILE WHEEL}
 wheel=${2:?Supply the reviewed phyai-robot wheel}
 case "$profile" in
   agilex-humble-py310-x86_64) minor=3.10; arch=x86_64 ;;
+  arx-jazzy-py312-x86_64) minor=3.12; arch=x86_64 ;;
   tianji-jazzy-py312-aarch64) minor=3.12; arch=aarch64 ;;
   *) echo "Unsupported profile: $profile" >&2; exit 1 ;;
 esac

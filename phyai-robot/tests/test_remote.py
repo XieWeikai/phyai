@@ -407,3 +407,36 @@ def test_server_rejects_outputs_that_do_not_match_its_spec():
         with pytest.raises(RemotePolicyError, match="dtype"):
             client.warmup(STATE)
         client.close()
+
+
+def test_run_options_update_task_before_reset_and_invalid_options_do_not_reserve():
+    with running() as (server, predictor, url):
+        tasks = []
+
+        def configure(options):
+            if set(options) != {"task"} or not options["task"]:
+                raise ValueError("invalid task")
+            tasks.append(options["task"])
+
+        server.configure_run = configure
+        bad = RemotePolicy(url)
+        with pytest.raises(Exception, match="invalid task"):
+            bad.begin_run({"task": ""})
+        bad.close()
+        assert server.run_id is None
+        first = RemotePolicy(url)
+        first.begin_run({"task": "Pour water."})
+        first.close()
+        second = RemotePolicy(url)
+        second.begin_run({"task": "Pick up the cup."})
+        second.close()
+        assert tasks == ["Pour water.", "Pick up the cup."]
+
+
+def test_legacy_server_rejects_run_options_instead_of_ignoring_prompt():
+    with running() as (server, predictor, url):
+        client = RemotePolicy(url)
+        with pytest.raises(Exception, match="run options"):
+            client.begin_run({"task": "Pour water."})
+        assert server.run_id is None
+        client.close()

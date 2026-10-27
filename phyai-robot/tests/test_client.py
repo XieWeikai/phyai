@@ -162,3 +162,46 @@ def test_horizon_longer_than_the_model_fails_before_activation():
     assert not any(event.startswith("activate") for event in events)
     assert backends[0].stop_count == 1
     assert server.run_id is None
+
+
+def test_cancel_during_warmup_never_activates_or_sends_actions():
+    events, backends, handles, errors = [], [], [], []
+    server, url, stop, thread = serve(SPEC, events)
+    entered, release = Event(), Event()
+    original = server.policy.predict
+
+    def predict(inputs):
+        entered.set()
+        assert release.wait(3)
+        return original(inputs)
+
+    server.policy.predict = predict
+
+    def run():
+        try:
+            run_remote(
+                RemotePolicy(url),
+                build=build_factory(events, backends),
+                scheduler=StopAndRefill(action_hz=50),
+                options=DeploymentOptions(control_hz=50),
+                on_deployment=handles.append,
+            )
+        except Exception as error:
+            errors.append(error)
+
+    worker = Thread(target=run)
+    worker.start()
+    try:
+        assert entered.wait(3)
+        handles[0].stop()
+        release.set()
+        worker.join(3)
+        assert not worker.is_alive() and not errors
+        assert backends[0].write_count == 0
+        assert not any(str(event).startswith("activate") for event in events)
+        assert server.run_id is None
+    finally:
+        release.set()
+        stop.set()
+        worker.join(3)
+        thread.join(3)

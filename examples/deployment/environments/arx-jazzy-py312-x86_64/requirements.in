@@ -1,0 +1,7 @@
+# Native ROS Jazzy and arx5_arm_msg are supplied by the host and its overlay.
+# NumPy 1.x remains compatible with distro ROS/OpenCV binary extensions.
+numpy==1.26.4
+Pillow==12.3.0
+pyzmq==27.2.0
+omegaconf==2.3.1
+PyYAML==6.0.3

@@ -1,0 +1,41 @@
+# ARX X5 2025 / AC One remote_slave. Drivers and arm preparation are external.
+max_steps: null
+robot:
+  domain_id: 0
+  node_name: phyai_arx
+  camera_transport: compressed
+  camera_topics:
+    base_camera: /camera/camera_h/color/image_rect_raw/compressed
+    left_wrist_camera: /camera/camera_l/color/image_rect_raw/compressed
+    right_wrist_camera: /camera/camera_r/color/image_rect_raw/compressed
+  model_cameras:
+    base: base_camera
+    left_wrist: left_wrist_camera
+    right_wrist: right_wrist_camera
+  state_topics:
+    left: /arm_slave_l_status
+    right: /arm_slave_r_status
+  command_topics:
+    left: /arm_master_l_status
+    right: /arm_master_r_status
+  controller_interface: external
+  controller_nodes:
+    left: /arm_slave_l
+    right: /arm_slave_r
+  service_timeout_s: 3.0
+  io_timeout_s: 0.1
+  qos: {camera: sensor_data, state: sensor_data, command: reliable}
+remote:
+  endpoint: tcp://127.0.0.1:5555
+  timeout_s: 2.0
+  warmup_timeout_s: 120.0
+control:
+  control_hz: 200.0
+  max_sample_age_s: 0.5
+  observation_timeout_s: 10.0
+  shutdown_timeout_s: 2.0
+  max_control_lateness_s: 0.01
+schedule:
+  strategy: stop_and_refill
+  action_hz: 30.0
+  execution_horizon: 25

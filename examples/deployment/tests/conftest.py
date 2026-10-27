@@ -51,6 +51,7 @@ def ros_messages(monkeypatch):
         "sensor_msgs": ["Image", "CompressedImage", "JointState"],
         "geometry_msgs": ["PoseStamped", "WrenchStamped"],
         "marvin_msgs": ["JointcmdArm", "Jointfeedback"],
+        "arx5_arm_msg": ["RobotStatus"],
     }.items():
         module(package)
         module(f"{package}.msg", **{name: message(name) for name in classes})

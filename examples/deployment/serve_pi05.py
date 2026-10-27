@@ -89,13 +89,39 @@ def main(argv=None) -> None:
     policy = Pi05Policy(config.policy, processing)
 
     try:
-        spec = policy.spec({"task": processing.task, "seed": config.policy.seed})
+        spec = policy.spec(
+            {
+                "task": processing.task,
+                "seed": config.policy.seed,
+                "checkpoint": str(checkpoint),
+            }
+        )
+
+        def configure_run(options):
+            if (
+                set(options) != {"task"}
+                or not isinstance(options["task"], str)
+                or not 1 <= len(options["task"].strip()) <= 4000
+            ):
+                raise ValueError(
+                    "run options require a nonempty task of at most 4000 characters"
+                )
+            processing.task = options["task"].strip()
+            server.spec = policy.spec(
+                {
+                    "task": processing.task,
+                    "seed": config.policy.seed,
+                    "checkpoint": str(checkpoint),
+                }
+            )
+
         server = PolicyServer(
             policy=policy,
             spec=spec,
             reset_run=policy.reset_run,
             endpoint=config.endpoint,
             lease_timeout_s=config.lease_timeout_s,
+            configure_run=configure_run,
         )
         print(
             f"pi0.5 server on {config.endpoint}: task={processing.task!r}, "

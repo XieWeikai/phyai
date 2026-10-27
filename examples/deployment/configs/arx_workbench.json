@@ -1,0 +1,20 @@
+{
+  "robot_kind": "arx",
+  "port": 10868,
+  "token": "REPLACE_WITH_A_RANDOM_PRIVATE_TOKEN",
+  "repository": "/opt/phyai",
+  "client_config": "/etc/phyai/arx-client.yaml",
+  "model_config": "/etc/phyai/arx-model.yaml",
+  "model_python": "/opt/phyai/.venv/bin/python",
+  "model_log": "/var/log/phyai/model.log",
+  "model_start_timeout_s": 150,
+  "checkpoint_roots": ["/srv/phyai-checkpoints"],
+  "preparation": {
+    "ready_position": [0, 0.948, 0.858, -0.573, 0, 0, -2.8, 0, 0.948, 0.858, -0.573, 0, 0, -2.8],
+    "policy_position": [0, 0.948, 0.858, -0.573, 0, 0, 0, 0, 0.948, 0.858, -0.573, 0, 0, 0],
+    "transition_s": 3.75,
+    "tolerance": 0.08,
+    "joint_position_min": [-10, -10, -10, -10, -10, -10],
+    "joint_position_max": [10, 10, 10, 10, 10, 10]
+  }
+}
