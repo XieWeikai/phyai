@@ -186,7 +186,7 @@ class SiglipVisionEncoder(nn.Module):
                     attn_out_bias=True,
                     rope=None,
                     mlp_gated=False,
-                    mlp_activation="gelu",
+                    mlp_activation=config.hidden_activation,
                     mlp_bias=True,
                     norm_type="layernorm",
                     norm_eps=config.layer_norm_eps,
@@ -479,7 +479,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_activation,
             gated=True,
             bias=False,
             params_dtype=params_dtype,
@@ -715,7 +715,7 @@ class PI05ExpertLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_activation,
             gated=True,
             bias=False,
             params_dtype=params_dtype,

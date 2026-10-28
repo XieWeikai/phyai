@@ -18,7 +18,13 @@ from omegaconf import MISSING
 from phyai_robot import FeatureSpec
 from numpy.typing import NDArray
 from phyai_robot.remote import PolicySpec
-from phyai_robot.adapters import STATE_KEY, ACTIONS_KEY, IMAGE_PREFIX
+from phyai_robot.adapters import (
+    STATE_KEY,
+    ACTIONS_KEY,
+    IMAGE_PREFIX,
+    ACTION_PREFIX_KEY,
+    PREFIX_LENGTH_KEY,
+)
 
 from .configuration import repository_path
 
@@ -36,6 +42,7 @@ class Pi05PolicyConfig:
             Set to null to use the checkpoint's native default (e.g. 5 steps for Tianji, 10 for AgileX).
         use_cuda_graph: Enable CUDA graph capture and replay for minimized execution jitter.
         num_threads: Number of CPU worker threads allocated to the PhyAI engine runtime.
+        vision_params_dtype: Optional vision tower precision; null keeps the engine default.
     """
 
     checkpoint: str = MISSING
@@ -44,6 +51,7 @@ class Pi05PolicyConfig:
     num_inference_steps: int | None = None
     use_cuda_graph: bool = True
     num_threads: int = 16
+    vision_params_dtype: str | None = None
 
     def validate(self) -> None:
         """Validate configuration paths and parameters without allocating GPU memory."""
@@ -51,6 +59,10 @@ class Pi05PolicyConfig:
             raise ValueError("policy.num_inference_steps must be positive or null")
         if self.num_threads < 1:
             raise ValueError("policy.num_threads must be positive")
+        if self.vision_params_dtype not in (None, "float32", "bfloat16"):
+            raise ValueError(
+                "policy.vision_params_dtype must be float32, bfloat16 or null"
+            )
         if not 0 <= self.seed < 2**64:
             raise ValueError("policy.seed must be in [0, 2**64)")
         if not self.checkpoint.strip() or not repository_path(self.checkpoint).is_dir():
@@ -157,6 +169,30 @@ class Pi05Processing:
             raise ValueError("model produced non-finite actions")
         return values
 
+    def encode_action_prefix(
+        self,
+        action_prefix: NDArray[np.float32],
+        state: NDArray[np.float32],
+        *,
+        max_action_dim: int,
+    ) -> Any:
+        """Map physical targets into normalized [1, P, max_action_dim] actions.
+
+        Factories that change action decoding must override this hook as well.
+        """
+        if (
+            getattr(self.postprocess, "__func__", None)
+            is not Pi05Processing.postprocess
+        ):
+            raise ValueError(
+                "custom postprocess requires an RTC encode_action_prefix override"
+            )
+        return self._processor.encode_action_prefix(
+            self._torch.from_numpy(np.array(action_prefix)).unsqueeze(0),
+            self._torch.from_numpy(np.array(state)).unsqueeze(0),
+            max_action_dim=max_action_dim,
+        ).float()
+
 
 class Pi05Policy:
     """Manages the resident PhyAI Pi0.5 inference engine and reproducible noise stream."""
@@ -183,19 +219,43 @@ class Pi05Policy:
         self.processing = processing
         self.num_inference_steps = int(model_config.num_inference_steps)
         self.horizon = int(model_config.chunk_size)
+        self.max_prefix_len = model_config.max_prefix_len
+        if (
+            type(self.max_prefix_len) is not int
+            or not 0 <= self.max_prefix_len < self.horizon
+        ):
+            raise ValueError("max_prefix_len must be an integer in [0, chunk_size)")
 
         self._torch = torch
         self._request_type = PI05Request
         self._max_action_dim = int(model_config.max_action_dim)
         self._seed = config.seed
         self._generator = torch.Generator().manual_seed(config.seed)
+        if self.max_prefix_len:
+            # Reject unsupported processing before allocating engine resources.
+            self._rtc_request(
+                {
+                    ACTION_PREFIX_KEY: np.zeros(
+                        (self.max_prefix_len, processing.action_dim), np.float32
+                    ),
+                    PREFIX_LENGTH_KEY: np.zeros(1, np.int64),
+                    STATE_KEY: np.zeros(processing.action_dim, np.float32),
+                }
+            )
 
         # Initialize the high-performance PhyAI CUDA inference engine.
         self._engine = Engine(
             EngineArgs(
                 plugin="pi05",
                 plugin_args=PI05Args(
-                    checkpoint_dir=checkpoint, config=model_config, max_batch_size=1
+                    checkpoint_dir=checkpoint,
+                    config=model_config,
+                    max_batch_size=1,
+                    vision_params_dtype=(
+                        getattr(torch, config.vision_params_dtype)
+                        if config.vision_params_dtype is not None
+                        else None
+                    ),
                 ),
                 config=EngineConfig(
                     device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
@@ -216,8 +276,19 @@ class Pi05Policy:
     def spec(self, metadata: Mapping[str, Any]) -> PolicySpec:
         """Assemble the complete PolicySpec describing model inputs, outputs, and metadata."""
         processing = self.processing
+        inputs = processing.input_schema()
+        rtc = {}
+        if self.max_prefix_len:
+            inputs = {
+                **inputs,
+                ACTION_PREFIX_KEY: FeatureSpec(
+                    (self.max_prefix_len, processing.action_dim), "float32"
+                ),
+                PREFIX_LENGTH_KEY: FeatureSpec((1,), "int64"),
+            }
+            rtc = {"rtc": {"max_prefix_len": self.max_prefix_len}}
         return PolicySpec(
-            inputs=processing.input_schema(),
+            inputs=inputs,
             outputs={
                 ACTIONS_KEY: FeatureSpec(
                     (self.horizon, processing.action_dim), processing.action_dtype
@@ -230,8 +301,48 @@ class Pi05Policy:
                 camera_names=processing.camera_names,
                 action_dim=processing.action_dim,
                 num_inference_steps=self.num_inference_steps,
+                **rtc,
             ),
         )
+
+    def _rtc_request(self, inputs: Mapping[str, NDArray[Any]]) -> dict[str, Any]:
+        if not self.max_prefix_len:
+            return {}
+        prefix = np.asarray(inputs[ACTION_PREFIX_KEY])
+        lengths = np.asarray(inputs[PREFIX_LENGTH_KEY])
+        if (
+            prefix.shape != (self.max_prefix_len, self.processing.action_dim)
+            or prefix.dtype != np.float32
+            or not np.isfinite(prefix).all()
+        ):
+            raise ValueError(
+                "action_prefix must match the finite float32 RTC input schema"
+            )
+        if (
+            lengths.shape != (1,)
+            or lengths.dtype != np.int64
+            or not 0 <= lengths[0] <= self.max_prefix_len
+        ):
+            raise ValueError("prefix_length must be int64[1] in [0, max_prefix_len]")
+        encoded = self.processing.encode_action_prefix(
+            prefix, inputs[STATE_KEY], max_action_dim=self._max_action_dim
+        )
+        torch = self._torch
+        if (
+            not isinstance(encoded, torch.Tensor)
+            or encoded.shape != (1, self.max_prefix_len, self._max_action_dim)
+            or encoded.dtype != torch.float32
+            or not torch.isfinite(encoded).all()
+        ):
+            raise ValueError(
+                "encode_action_prefix must return finite float32[1, K, max_action_dim]"
+            )
+        encoded = encoded.clone()
+        encoded[:, int(lengths[0]) :] = 0
+        return {
+            "action_prefix": encoded,
+            "prefix_lengths": torch.from_numpy(lengths.copy()),
+        }
 
     def predict(self, inputs: Mapping[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
         """Synchronously execute preprocessing, Euler denoising, and postprocessing.
@@ -244,6 +355,7 @@ class Pi05Policy:
             if self._close_requested.is_set():
                 raise RuntimeError("Pi05Policy is closed")
             try:
+                rtc_request = self._rtc_request(inputs)
                 processed = self.processing.preprocess(inputs)
                 # Sample initial Gaussian noise (shape: (1, horizon, max_action_dim)).
                 noise = torch.randn(
@@ -261,6 +373,7 @@ class Pi05Policy:
                                 input_ids=processed.input_ids,
                                 lang_lens=processed.lang_lens,
                                 noise=noise,
+                                **rtc_request,
                             )
                         )
                         .detach()

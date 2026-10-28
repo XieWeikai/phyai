@@ -45,8 +45,11 @@ class SiglipVisionConfig(PretrainedConfig):
     # Output dim of the multi_modal_projector; equals the text-side
     # hidden size (gemma_2b: 2048, gemma_300m: 1024).
     projection_dim: int = 2048
+    hidden_activation: str = "gelu"
 
     def __post_init__(self) -> None:
+        if self.hidden_activation not in ("gelu", "gelu_tanh"):
+            raise ValueError("vision.hidden_activation must be gelu or gelu_tanh")
         if self.image_size % self.patch_size != 0:
             raise ValueError(
                 f"image_size={self.image_size} not divisible by "
@@ -92,8 +95,11 @@ class PaliGemmaTextConfig(PretrainedConfig):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     max_position_embeddings: int = 8192
+    hidden_activation: str = "gelu"
 
     def __post_init__(self) -> None:
+        if self.hidden_activation not in ("gelu", "gelu_tanh"):
+            raise ValueError("text.hidden_activation must be gelu or gelu_tanh")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
                 f"num_attention_heads={self.num_attention_heads} not divisible by "
@@ -138,8 +144,11 @@ class GemmaExpertConfig(PretrainedConfig):
     max_position_embeddings: int = 8192
     use_adarms: bool = True
     adarms_cond_dim: int = 1024
+    hidden_activation: str = "gelu"
 
     def __post_init__(self) -> None:
+        if self.hidden_activation not in ("gelu", "gelu_tanh"):
+            raise ValueError("expert.hidden_activation must be gelu or gelu_tanh")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
                 f"num_attention_heads={self.num_attention_heads} not divisible by "
@@ -186,6 +195,7 @@ class PI05Config(PretrainedConfig):
     chunk_size: int = 50
     max_action_dim: int = 32
     num_inference_steps: int = 10
+    max_prefix_len: int = 0
     min_period: float = 4e-3
     max_period: float = 4.0
     tokenizer_max_length: int = 200
@@ -229,6 +239,19 @@ class PI05Config(PretrainedConfig):
             )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}.")
+        if (
+            isinstance(self.max_prefix_len, bool)
+            or not isinstance(self.max_prefix_len, int)
+            or not 0 <= self.max_prefix_len < self.chunk_size
+        ):
+            raise ValueError(
+                f"max_prefix_len must be an integer in [0, {self.chunk_size}), "
+                f"got {self.max_prefix_len}."
+            )
+        if self.max_prefix_len and not self.expert.use_adarms:
+            raise ValueError(
+                "RTC requires expert.use_adarms=True for token conditioning."
+            )
         if self.num_inference_steps <= 0:
             raise ValueError(
                 f"num_inference_steps must be positive, got {self.num_inference_steps}."

@@ -164,7 +164,8 @@
             "group": "部署",
             "pages": [
               "zh/deployment/server-gateway",
-              "zh/deployment/parallel-serving"
+              "zh/deployment/parallel-serving",
+              "zh/deployment/training-time-rtc"
             ]
           },
           {

@@ -30,7 +30,7 @@ batch sharding are deployment concerns outside this scheduler.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -90,12 +90,20 @@ class PI05Request:
     ``noise`` is optional; if ``None`` the scheduler samples a fresh
     Gaussian (over the *real* batch only — the padded tail uses zeros
     that get discarded with the rest of the padded output).
+
+    ``action_prefix`` is optional ``(B, P, max_action_dim)`` in the CURRENT
+    observation's normalized action coordinates. The caller must rebase
+    joint deltas before normalization. ``prefix_lengths`` is an optional
+    integer ``(B,)`` tensor in ``[0, P]``; by default all P tokens are known.
+    The returned chunk includes the unchanged prefix.
     """
 
     pixel_values: torch.Tensor
     input_ids: torch.Tensor
     lang_lens: torch.Tensor
     noise: torch.Tensor | None = None
+    action_prefix: torch.Tensor | None = field(default=None, kw_only=True)
+    prefix_lengths: torch.Tensor | None = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -269,6 +277,7 @@ class PI05Scheduler(Scheduler):
             batch_size=self.max_batch_size,
             chunk_size=cfg.chunk_size,
             max_action_dim=cfg.max_action_dim,
+            max_prefix_len=cfg.max_prefix_len,
             params_dtype=self.params_dtype,
             device=self.device,
             suffix_value_head=(model.value_head if not cfg.value_after_vlm else None),
@@ -323,6 +332,8 @@ class PI05Scheduler(Scheduler):
         # matmuls out of the captured Euler loop.
         N = self.cfg.num_inference_steps
         ts = torch.linspace(1.0, 1.0 / N, N, dtype=torch.float32, device=self.device)
+        if self.cfg.max_prefix_len:
+            ts = torch.cat([ts, ts.new_zeros(1)])
         with torch.no_grad():
             self.time_emb_table = self.model.heads.embed_time(ts).contiguous()
         # Bind the schedule before the expert runner captures: its graph
@@ -363,6 +374,8 @@ class PI05Scheduler(Scheduler):
             dtype=torch.float32,
             device=self.device,
         )
+        if self.cfg.max_prefix_len:
+            times = torch.cat([times, times.new_zeros(1)])
         updated_time_embeddings = self.model.heads.embed_time(times).contiguous()
         if self.time_emb_table is not None:
             self.time_emb_table.copy_(updated_time_embeddings)
@@ -513,6 +526,10 @@ class PI05Scheduler(Scheduler):
 
         actual_B = int(request.pixel_values.shape[0])
         max_B = self.max_batch_size
+        if cfg.max_prefix_len:
+            self.expert_runner.set_action_prefix(
+                request.action_prefix, request.prefix_lengths
+            )
         self._prepare_prefix(request)
 
         # Sample noise (or use the user's, padded) and run the whole
@@ -558,6 +575,8 @@ class PI05Scheduler(Scheduler):
         comparison. Policy-specific output reduction remains with the caller.
         """
         self._validate(request)
+        if request.action_prefix is not None and request.action_prefix.shape[1]:
+            raise ValueError("rollout_step does not support action prefixes.")
         actual_B = int(request.pixel_values.shape[0])
         request_sigmas = self._validate_rollout(request, actual_B)
         prefix_out, layout = self._prepare_prefix(request)
@@ -909,6 +928,38 @@ class PI05Scheduler(Scheduler):
                 f"(B, chunk_size, max_action_dim)="
                 f"({actual_B}, {cfg.chunk_size}, {cfg.max_action_dim})."
             )
+        if req.action_prefix is None:
+            if req.prefix_lengths is not None:
+                raise ValueError("prefix_lengths requires action_prefix.")
+            return
+        prefix = req.action_prefix
+        if (
+            not isinstance(prefix, torch.Tensor)
+            or prefix.ndim != 3
+            or prefix.shape[0] != actual_B
+            or prefix.shape[2] != cfg.max_action_dim
+        ):
+            raise ValueError("action_prefix must have shape (B, P, max_action_dim).")
+        prefix_size = prefix.shape[1]
+        if prefix_size > cfg.max_prefix_len:
+            raise ValueError(
+                f"action_prefix length {prefix_size} exceeds "
+                f"max_prefix_len={cfg.max_prefix_len}."
+            )
+        if prefix.is_complex() or not torch.isfinite(prefix.to(torch.float32)).all():
+            raise ValueError("action_prefix must contain finite normalized actions.")
+        lengths = req.prefix_lengths
+        if lengths is not None:
+            if (
+                not isinstance(lengths, torch.Tensor)
+                or lengths.shape != (actual_B,)
+                or lengths.dtype not in (torch.int32, torch.int64)
+            ):
+                raise ValueError(
+                    "prefix_lengths must be an integer tensor of shape (B,)."
+                )
+            if ((lengths < 0) | (lengths > prefix_size)).any():
+                raise ValueError("prefix_lengths must lie in [0, P].")
 
 
 __all__ = [
