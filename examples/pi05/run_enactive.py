@@ -31,6 +31,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-cuda-graph", action="store_true")
+    parser.add_argument("--enable-rlt", action="store_true")
+    parser.add_argument("--enable-rtc", action="store_true")
     args = parser.parse_args()
 
     processor = PI05Processor.from_pretrained(
@@ -69,7 +71,11 @@ def main() -> None:
     engine = Engine(
         EngineArgs(
             plugin="pi05",
-            plugin_args=PI05Args(checkpoint_dir=args.checkpoint),
+            plugin_args=PI05Args(
+                checkpoint_dir=args.checkpoint,
+                enable_rlt=args.enable_rlt,
+                enable_rtc=args.enable_rtc,
+            ),
             config=EngineConfig(
                 device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
                 runtime=RuntimeConfig(use_cuda_graph=not args.no_cuda_graph),

@@ -19,7 +19,7 @@ explicitly when overriding from defaults.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from phyai.models.configuration import PretrainedConfig
 
@@ -297,9 +297,29 @@ class PI05Config(PretrainedConfig):
         return self.expert.hidden_size
 
 
+def resolve_inference_config(
+    config: PI05Config, *, enable_rlt: bool = False, enable_rtc: bool = False
+) -> PI05Config:
+    """Apply explicit runtime choices without changing checkpoint training metadata."""
+    if type(enable_rlt) is not bool or type(enable_rtc) is not bool:
+        raise ValueError("enable_rlt and enable_rtc must be booleans")
+    if enable_rlt and config.rlt_mode == "off":
+        raise ValueError("enable_rlt requires an RLT-trained checkpoint configuration")
+    if enable_rtc and config.max_prefix_len == 0:
+        raise ValueError(
+            "enable_rtc requires a checkpoint trained with max_prefix_len > 0"
+        )
+    return replace(
+        config,
+        rlt_mode=config.rlt_mode if enable_rlt else "off",
+        max_prefix_len=config.max_prefix_len if enable_rtc else 0,
+    )
+
+
 __all__ = [
     "SiglipVisionConfig",
     "PaliGemmaTextConfig",
     "GemmaExpertConfig",
     "PI05Config",
+    "resolve_inference_config",
 ]

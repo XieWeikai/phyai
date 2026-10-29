@@ -26,6 +26,7 @@ from phyai.models.pi05.configuration_pi05 import (
     PaliGemmaTextConfig,
     PI05Config,
     SiglipVisionConfig,
+    resolve_inference_config,
 )
 from phyai.models.pi05.modeling_pi05 import (
     SIGLIP_NORM_HF_NAMES,
@@ -57,6 +58,7 @@ __all__ = [
     "PaliGemmaTextConfig",
     "PI05Config",
     "SiglipVisionConfig",
+    "resolve_inference_config",
     # Modeling
     "ActionTimeHeads",
     "ExpertLayerModulation",

@@ -110,9 +110,9 @@ def benchmark(
     n_warmup: int,
     n_timed: int,
     synchronize_cuda: bool,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor | PI05Output, dict[str, float]]:
     """Warm + ``n_timed`` ``engine.step`` calls; return last action + ms stats."""
-    actions: torch.Tensor | None = None
+    actions: torch.Tensor | PI05Output | None = None
     for _ in range(n_warmup):
         actions = engine.step(request)
     if synchronize_cuda:
@@ -228,6 +228,8 @@ def main() -> None:
             "mutually exclusive with --dump-filter."
         ),
     )
+    parser.add_argument("--enable-rlt", action="store_true")
+    parser.add_argument("--enable-rtc", action="store_true")
     args = parser.parse_args()
 
     if args.replica_count < 1:
@@ -252,6 +254,8 @@ def main() -> None:
             max_batch_size=args.batch_size,
             vision_params_dtype=vision_dtype,
             inputs_image_shape=inputs_image_shape,
+            enable_rlt=args.enable_rlt,
+            enable_rtc=args.enable_rtc,
         ),
         config=EngineConfig(
             device=DeviceConfig(target="cuda", params_dtype=dtype),

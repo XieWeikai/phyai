@@ -43,6 +43,8 @@ class Pi05PolicyConfig:
         use_cuda_graph: Enable CUDA graph capture and replay for minimized execution jitter.
         num_threads: Number of CPU worker threads allocated to the PhyAI engine runtime.
         vision_params_dtype: Optional vision tower precision; null keeps the engine default.
+        enable_rlt: Opt in to trained RL-token inference; false preserves action-only output.
+        enable_rtc: Opt in to trained action-prefix conditioning; false keeps ordinary Pi05.
     """
 
     checkpoint: str = MISSING
@@ -52,9 +54,13 @@ class Pi05PolicyConfig:
     use_cuda_graph: bool = True
     num_threads: int = 16
     vision_params_dtype: str | None = None
+    enable_rlt: bool = False
+    enable_rtc: bool = False
 
     def validate(self) -> None:
         """Validate configuration paths and parameters without allocating GPU memory."""
+        if type(self.enable_rlt) is not bool or type(self.enable_rtc) is not bool:
+            raise ValueError("policy.enable_rlt and policy.enable_rtc must be booleans")
         if self.num_inference_steps is not None and self.num_inference_steps < 1:
             raise ValueError("policy.num_inference_steps must be positive or null")
         if self.num_threads < 1:
@@ -205,7 +211,10 @@ class Pi05Policy:
         from phyai.kernel.config import KernelConfig
         from phyai.models.pi05.main_pi05 import PI05Args
         from phyai.models.pi05.scheduler_pi05 import PI05Request
-        from phyai.models.pi05.configuration_pi05 import PI05Config
+        from phyai.models.pi05.configuration_pi05 import (
+            PI05Config,
+            resolve_inference_config,
+        )
         from phyai import Engine, EngineArgs
 
         checkpoint = repository_path(config.checkpoint)
@@ -216,6 +225,12 @@ class Pi05Policy:
                 model_config, num_inference_steps=config.num_inference_steps
             )
 
+        checkpoint_config = model_config
+        model_config = resolve_inference_config(
+            checkpoint_config,
+            enable_rlt=config.enable_rlt,
+            enable_rtc=config.enable_rtc,
+        )
         self.processing = processing
         self.num_inference_steps = int(model_config.num_inference_steps)
         self.horizon = int(model_config.chunk_size)
@@ -253,7 +268,9 @@ class Pi05Policy:
                 plugin="pi05",
                 plugin_args=PI05Args(
                     checkpoint_dir=checkpoint,
-                    config=model_config,
+                    config=checkpoint_config,
+                    enable_rlt=config.enable_rlt,
+                    enable_rtc=config.enable_rtc,
                     max_batch_size=1,
                     vision_params_dtype=(
                         getattr(torch, config.vision_params_dtype)

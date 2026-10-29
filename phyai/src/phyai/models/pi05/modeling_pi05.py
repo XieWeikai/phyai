@@ -32,6 +32,7 @@ from phyai.models.pi05.configuration_pi05 import (
     PaliGemmaTextConfig,
     PI05Config,
     SiglipVisionConfig,
+    resolve_inference_config,
 )
 from phyai.weights.shards import replicated
 
@@ -1098,8 +1099,14 @@ class PI05Model(nn.Module):
         norm_backend: str | None = None,
         rope_backend: str | None = None,
         device: torch.device | str | None = None,
+        enable_rlt: bool = False,
+        enable_rtc: bool = False,
     ) -> None:
         super().__init__()
+        self.checkpoint_config = config
+        config = resolve_inference_config(
+            config, enable_rlt=enable_rlt, enable_rtc=enable_rtc
+        )
         params_dtype = resolve_params_dtype(params_dtype)
         # The vision tower may run at a different (typically higher) precision
         # than the rest of the model — openpi / lerobot keep SigLIP + projector

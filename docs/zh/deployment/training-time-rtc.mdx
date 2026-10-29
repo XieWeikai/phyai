@@ -31,7 +31,7 @@ flowchart LR
 
 这条路径复用已有权重、time MLP、AdaRMS、attention 和输出头。没有新增可训练参数，也不改变 checkpoint 权重的名称与 shape。PhyAI 的 AdaRMS 已支持逐行调制，因此修改集中在 PI0.5 配置、请求、scheduler 和 runner，无需修改通用算子。
 
-`max_prefix_len` 必须从真实训练配置写入导出的 `config.json`。没有该字段的旧 checkpoint 默认值是 `0`。改大这个字段不能替代 RTC 训练。Wall 的 loss 权重和 RLT token sidecar 是独立功能；部署这一版 RTC 不需要它们。
+`max_prefix_len` 必须从真实训练配置写入导出的 `config.json`，它记录训练能力。没有该字段的旧 checkpoint 默认值是 `0`。实际使用还需要构建时显式设置 `PI05Args(enable_rtc=True)` 或 `PI05Model(config, enable_rtc=True)`；运行开关默认关闭，关闭后走原来的普通 Pi05 路径。改大 K 或打开开关都不能替代 RTC 训练。Wall 的 loss 权重和 RLT token sidecar 是独立功能。
 
 ## 模型请求与 CUDA graph
 
@@ -135,7 +135,16 @@ execution_horizon + prefix_steps ≤ H
 
 ## 配置 Tianji
 
-模型目录继续保留 `config.json`、权重、tokenizer、`policy_preprocessor.json`、`policy_postprocessor.json` 和统计文件。沿用原来的 `server.yaml` 与 `serve_pi05.py` 入口。训练导出需要保留真实的 `max_prefix_len`；前缀相关 schema 根据这个字段自动发布，无需新增 server 进程或修改 ROS topic。
+模型目录继续保留 `config.json`、权重、tokenizer、`policy_preprocessor.json`、`policy_postprocessor.json` 和统计文件。沿用原来的 `server.yaml` 与 `serve_pi05.py` 入口。训练导出需要保留真实的 `max_prefix_len`；server 只有在 `policy.enable_rtc=true` 时才发布前缀 schema，无需新增进程或修改 ROS topic。
+
+```yaml
+# server.yaml
+policy:
+  enable_rtc: true
+  enable_rlt: false
+```
+
+RLT 与 RTC 可以独立启用；两项默认都关闭，旧配置无需补字段即可继续使用。
 
 下面是 **H=50、训练 K 至少为 8** 时的 client 配置示例：
 
@@ -155,7 +164,8 @@ control:
 | 配置 | 作用 |
 | --- | --- |
 | checkpoint `chunk_size=50` | 每次输出 50 个动作，包括固定前缀 |
-| checkpoint `max_prefix_len` | 训练过的最长前缀；0 禁用模型侧 RTC |
+| checkpoint `max_prefix_len` | 训练过的最长前缀；0 表示未训练 RTC |
+| server `policy.enable_rtc=true` | 本次构建启用 RTC；默认 false |
 | `schedule.prefix_steps=8` | 锁定 8 个已承诺目标，提供 280 ms 推理预算 |
 | `schedule.execution_horizon=25` | 在 RTC 模式下，每经过 25 个动作周期发起下一次预测 |
 | `schedule.action_hz=25` | 源动作每 40 ms 消耗一个；应按训练时间间隔与实验播放速度选择 |
@@ -179,7 +189,9 @@ python -m examples.deployment.tianji \
 
 ```bash
 # Model environment
-python -m examples.deployment.serve_pi05 --config /path/to/rtc-model/server.yaml
+python -m examples.deployment.serve_pi05 \
+  --config /path/to/rtc-model/server.yaml \
+  policy.enable_rtc=true
 
 # Robot environment; enables control after warmup and validation
 python -m examples.deployment.tianji \
