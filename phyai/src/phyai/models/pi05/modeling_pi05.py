@@ -1174,6 +1174,19 @@ class PI05Model(nn.Module):
             norm_backend=norm_backend,
         )
 
+        self.rlt_token = None
+        if config.rlt_mode != "off":
+            from phyai.models.pi05.modeling_rlt_pi05 import PI05RLTTokenAutoencoder
+
+            # LoongForge stores the learned sidecar in FP32 independently of Pi05.
+            self.rlt_token = PI05RLTTokenAutoencoder(
+                input_dim=config.text.hidden_size,
+                embed_dim=config.text.hidden_size,
+                max_visual_tokens=config.rlt_max_visual_tokens,
+                params_dtype=torch.float32,
+                device=device,
+            )
+
         # Shared RoPE — held at the model level (not per-layer) so the
         # 8 MiB cos/sin cache is allocated once, not 18x. Layers take
         # rope as a forward argument; nothing about RoPE is

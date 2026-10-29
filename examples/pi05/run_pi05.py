@@ -34,7 +34,7 @@ from phyai import DeploymentConfig, Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_pi05 import PI05Request
+from phyai.models.pi05.scheduler_pi05 import PI05Output, PI05Request
 from phyai.server import WorkerSupervisorConfig
 from phyai.utils import load_config
 
@@ -324,6 +324,9 @@ def main() -> None:
 
         # Managed results are CUDA-IPC views of worker memory; take a durable
         # CPU copy before the CPU-side postprocess.
+        if isinstance(actions, PI05Output):
+            print(f"RL token shape     : {tuple(actions.rl_token.shape)}")
+            actions = actions.actions
         if managed:
             actions = actions.cpu()
 

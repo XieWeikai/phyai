@@ -200,6 +200,10 @@ class PI05Config(PretrainedConfig):
     max_period: float = 4.0
     tokenizer_max_length: int = 200
 
+    # LoongForge stage-one sidecar; either trained mode enables token inference.
+    rlt_mode: str = "off"
+    rlt_max_visual_tokens: int = 768
+
     # RL critic. ``value_after_vlm`` selects the prefix or suffix residual
     # stream. ``critic_action_chunk=None`` pools the full suffix horizon.
     add_value_head: bool = False
@@ -208,6 +212,15 @@ class PI05Config(PretrainedConfig):
     critic_action_chunk: int | None = None
 
     def __post_init__(self) -> None:
+        if self.rlt_mode not in ("off", "token_only", "joint"):
+            raise ValueError("rlt_mode must be off, token_only or joint")
+        if (
+            type(self.rlt_max_visual_tokens) is not int
+            or self.rlt_max_visual_tokens < 1
+        ):
+            raise ValueError("rlt_max_visual_tokens must be a positive integer")
+        if self.rlt_mode != "off" and self.text.hidden_size % 8:
+            raise ValueError("RLT text.hidden_size must be divisible by eight heads")
         if self.vision.projection_dim != self.text.hidden_size:
             raise ValueError(
                 f"vision.projection_dim={self.vision.projection_dim} must equal "

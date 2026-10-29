@@ -17,7 +17,7 @@ from phyai import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_pi05 import PI05Request
+from phyai.models.pi05.scheduler_pi05 import PI05Output, PI05Request
 from phyai.utils import get_logger, load_config
 from phyai_utils_tools.models.pi05 import PI05Processor
 
@@ -86,12 +86,17 @@ def main() -> None:
                     noise=noise,
                 )
             )
+        extra = {}
+        if isinstance(normalized, PI05Output):
+            extra["rl_token"] = normalized.rl_token.float().cpu().numpy()
+            normalized = normalized.actions
         actions = processor.postprocess({"action": normalized, "state": raw_state})
         args.output.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             args.output,
             actions=actions.numpy(),
             normalized_actions=normalized.float().cpu().numpy(),
+            **extra,
         )
         logger.info_rank0(
             "Saved absolute joint targets %s to %s", tuple(actions.shape), args.output

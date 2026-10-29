@@ -41,6 +41,7 @@ from phyai.layers.quant.active import resolve_quant_plan, use_quant_plan
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_pi05 import (
+    PI05Output,
     PI05Request,
     PI05RolloutOutput,
     PI05RolloutRequest,
@@ -242,8 +243,8 @@ class PI05Entry(Entry):
                 )
         return len(inputs_image_shape)
 
-    def step(self, request: PI05Request) -> torch.Tensor:  # type: ignore[override]
-        """Run one pi0.5 inference; return the action chunk ``(B, chunk, action_dim)``."""
+    def step(self, request: PI05Request) -> torch.Tensor | PI05Output:
+        """Return actions, plus an RL token when the checkpoint enables RLT."""
         if isinstance(request, PI05RolloutRequest):
             raise TypeError(
                 "PI05RolloutRequest must be passed to rollout_step(), not step()."

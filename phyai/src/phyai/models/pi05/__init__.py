@@ -48,6 +48,7 @@ from phyai.models.pi05.modeling_pi05 import (
     VisionTowerWrapper,
     create_sinusoidal_pos_embedding,
 )
+from phyai.models.pi05.modeling_rlt_pi05 import PI05RLTTokenAutoencoder
 
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     "PI05ExpertLayer",
     "PI05ExpertStack",
     "PI05Model",
+    "PI05RLTTokenAutoencoder",
     "PI05VisionTower",
     "PositionEmbedding",
     "SIGLIP_NORM_HF_NAMES",

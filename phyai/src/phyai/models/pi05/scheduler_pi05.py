@@ -30,6 +30,7 @@ batch sharding are deployment concerns outside this scheduler.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -104,6 +105,27 @@ class PI05Request:
     noise: torch.Tensor | None = None
     action_prefix: torch.Tensor | None = field(default=None, kw_only=True)
     prefix_lengths: torch.Tensor | None = field(default=None, kw_only=True)
+
+
+@dataclass
+class PI05Output(Mapping[str, torch.Tensor]):
+    """RLT-enabled inference result; ordinary Pi05 still returns an action tensor."""
+
+    actions: torch.Tensor  # [B, H, max_action_dim], normalized model actions.
+    rl_token: torch.Tensor  # [B, 1, text.hidden_size], unnormalized representation.
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        if key == "actions":
+            return self.actions
+        if key == "rl_token":
+            return self.rl_token
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("actions", "rl_token"))
+
+    def __len__(self) -> int:
+        return 2
 
 
 @dataclass
@@ -197,6 +219,8 @@ class PI05Scheduler(Scheduler):
 
         # Layout knobs.
         self.image_token_count = cfg.vision.num_patches * self.num_images
+        if cfg.rlt_mode != "off" and self.image_token_count > cfg.rlt_max_visual_tokens:
+            raise ValueError("camera token count exceeds rlt_max_visual_tokens")
         self.n_per_sample = self.image_token_count + cfg.tokenizer_max_length
 
         # Prefix-length buckets. Each LLM prefix runs at a fixed graph
@@ -288,6 +312,18 @@ class PI05Scheduler(Scheduler):
             * (self.n_per_sample + cfg.chunk_size),
         )
 
+        self.rlt_runner = None
+        if cfg.rlt_mode != "off":
+            from phyai.models.pi05.model_runner_rlt_pi05 import PI05RLTRunner
+
+            self.rlt_runner = PI05RLTRunner(
+                model.rlt_token,
+                batch_size=self.max_batch_size,
+                visual_tokens=self.image_token_count,
+                device=self.device,
+                use_cuda_graph=use_cuda_graph,
+            )
+
         # ``(num_inference_steps, expert_hidden)`` lookup table —
         # populated by :meth:`setup` after ``load_pretrained``. Each
         # row is the full time-MLP output for one Euler step's ``t``;
@@ -359,6 +395,8 @@ class PI05Scheduler(Scheduler):
         # Capture the expert graph last — the schedule + write indices it
         # reads in-graph must already be bound above.
         self.expert_runner.setup()
+        if self.rlt_runner is not None:
+            self.rlt_runner.setup()
 
     @torch.no_grad()
     def refresh_weight_dependent_state(self) -> None:
@@ -512,7 +550,7 @@ class PI05Scheduler(Scheduler):
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def step(self, request: PI05Request) -> torch.Tensor:
+    def step(self, request: PI05Request) -> torch.Tensor | PI05Output:
         """Run one inference; return the action chunk ``(actual_B, chunk, action_dim)``.
 
         ``actual_B`` is ``request.pixel_values.shape[0]`` and may be any
@@ -530,7 +568,17 @@ class PI05Scheduler(Scheduler):
             self.expert_runner.set_action_prefix(
                 request.action_prefix, request.prefix_lengths
             )
-        self._prepare_prefix(request)
+        prefix_out, layout = self._prepare_prefix(request)
+        rl_token = None
+        if self.rlt_runner is not None:
+            with event_scope("pi05.rl_token"):
+                visual = prefix_out.view(
+                    max_B, layout.n_per_sample, cfg.text.hidden_size
+                )[:, : self.image_token_count]
+                visual_mask = layout.prefix_mask[:, : self.image_token_count]
+                rl_token = self.rlt_runner.forward(visual, visual_mask)[
+                    :actual_B
+                ].clone()
 
         # Sample noise (or use the user's, padded) and run the whole
         # Euler loop as one captured-graph replay. The expert runner
@@ -565,7 +613,8 @@ class PI05Scheduler(Scheduler):
             x_t = self.expert_runner.forward(noise)
         # ``x_t`` aliases the captured graph's static output buffer — clone
         # it (and drop the padded tail) so the result survives the next step.
-        return x_t[:actual_B].clone()
+        actions = x_t[:actual_B].clone()
+        return actions if rl_token is None else PI05Output(actions, rl_token)
 
     @torch.no_grad()
     def rollout_step(self, request: PI05RolloutRequest) -> PI05RolloutOutput:
@@ -964,6 +1013,7 @@ class PI05Scheduler(Scheduler):
 
 __all__ = [
     "PI05Request",
+    "PI05Output",
     "PI05RolloutOutput",
     "PI05RolloutRequest",
     "PI05Scheduler",

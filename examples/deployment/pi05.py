@@ -220,6 +220,10 @@ class Pi05Policy:
         self.num_inference_steps = int(model_config.num_inference_steps)
         self.horizon = int(model_config.chunk_size)
         self.max_prefix_len = model_config.max_prefix_len
+        self.rlt_mode = model_config.rlt_mode
+        self.rlt_token_dim = (
+            int(model_config.text.hidden_size) if self.rlt_mode != "off" else 0
+        )
         if (
             type(self.max_prefix_len) is not int
             or not 0 <= self.max_prefix_len < self.horizon
@@ -277,6 +281,11 @@ class Pi05Policy:
         """Assemble the complete PolicySpec describing model inputs, outputs, and metadata."""
         processing = self.processing
         inputs = processing.input_schema()
+        outputs = {
+            ACTIONS_KEY: FeatureSpec(
+                (self.horizon, processing.action_dim), processing.action_dtype
+            )
+        }
         rtc = {}
         if self.max_prefix_len:
             inputs = {
@@ -287,13 +296,19 @@ class Pi05Policy:
                 PREFIX_LENGTH_KEY: FeatureSpec((1,), "int64"),
             }
             rtc = {"rtc": {"max_prefix_len": self.max_prefix_len}}
+        rlt = {}
+        if self.rlt_mode != "off":
+            outputs["rl_token"] = FeatureSpec((1, self.rlt_token_dim), "float32")
+            rlt = {
+                "rlt": {
+                    "mode": self.rlt_mode,
+                    "token_dim": self.rlt_token_dim,
+                    "source": "final_vlm_visual_hidden_states",
+                }
+            }
         return PolicySpec(
             inputs=inputs,
-            outputs={
-                ACTIONS_KEY: FeatureSpec(
-                    (self.horizon, processing.action_dim), processing.action_dtype
-                )
-            },
+            outputs=outputs,
             metadata=dict(
                 metadata,
                 horizon=self.horizon,
@@ -302,6 +317,7 @@ class Pi05Policy:
                 action_dim=processing.action_dim,
                 num_inference_steps=self.num_inference_steps,
                 **rtc,
+                **rlt,
             ),
         )
 
@@ -366,22 +382,32 @@ class Pi05Policy:
                     dtype=torch.float32,
                 )
                 with torch.inference_mode():
-                    normalized = (
-                        self._engine.step(
-                            self._request_type(
-                                pixel_values=processed.pixel_values,
-                                input_ids=processed.input_ids,
-                                lang_lens=processed.lang_lens,
-                                noise=noise,
-                                **rtc_request,
-                            )
+                    result = self._engine.step(
+                        self._request_type(
+                            pixel_values=processed.pixel_values,
+                            input_ids=processed.input_ids,
+                            lang_lens=processed.lang_lens,
+                            noise=noise,
+                            **rtc_request,
                         )
-                        .detach()
-                        .float()
-                        .cpu()
                     )
+                    normalized = result.actions if self.rlt_mode != "off" else result
+                    normalized = normalized.detach().float().cpu()
+                    if self.rlt_mode != "off":
+                        token = result.rl_token.detach().float().cpu().numpy()
+                        if (
+                            token.shape != (1, 1, self.rlt_token_dim)
+                            or not np.isfinite(token).all()
+                        ):
+                            raise ValueError(
+                                "model must produce a finite rl_token with shape "
+                                f"(1, 1, {self.rlt_token_dim})"
+                            )
                 actions = self.processing.postprocess(normalized, inputs[STATE_KEY])
-                return {ACTIONS_KEY: actions}
+                outputs = {ACTIONS_KEY: actions}
+                if self.rlt_mode != "off":
+                    outputs["rl_token"] = token[0]
+                return outputs
             finally:
                 if self._close_requested.is_set():
                     self._close_engine()
